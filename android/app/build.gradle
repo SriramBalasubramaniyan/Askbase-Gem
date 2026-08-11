@@ -1,0 +1,45 @@
+plugins {
+    id "com.android.application"
+    id "kotlin-android"
+    id "dev.flutter.flutter-gradle-plugin"
+}
+
+android {
+    namespace "com.example.askbase_gem"
+    compileSdk 36
+    ndkVersion flutter.ndkVersion
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    kotlinOptions {
+        jvmTarget = "1.8"
+    }
+
+    defaultConfig {
+        applicationId "com.example.askbase_gem"
+        minSdk 24
+        targetSdk flutter.targetSdkVersion
+        versionCode 1
+        versionName "1.0.0"
+        ndk {
+            // armeabi-v7a included intentionally: MediaPipe tasks-genai is the
+            // only on-device LLM runtime that ships this ABI, which is why it
+            // was chosen over alternatives (see README) — budget/32-bit
+            // Android devices depend on it.
+            abiFilters "armeabi-v7a", "arm64-v8a", "x86_64"
+        }
+    }
+
+    buildTypes {
+        release {
+            signingConfig signingConfigs.debug
+        }
+    }
+}
+
+flutter {
+    source "../.."
+}
