@@ -51,4 +51,30 @@ class ChatMessage {
   bool get isAssistant => role == MessageRole.assistant;
   bool get isLoading =>
       state == MessageState.thinking || state == MessageState.streaming;
+
+  // ── Persistence ─────────────────────────────────────────────────────────
+  // Only messages in a settled state (done/error) are ever persisted — see
+  // ChatHistoryService — so state always round-trips as "done" or "error".
+
+  Map<String, dynamic> toJson() => {
+        'id': id,
+        'role': role.name,
+        'content': content,
+        'state': state.name,
+        'timestamp': timestamp.toIso8601String(),
+        'generatedSql': generatedSql,
+        'rawData': rawData,
+      };
+
+  factory ChatMessage.fromJson(Map<String, dynamic> json) {
+    return ChatMessage(
+      id: json['id'] as String,
+      role: MessageRole.values.byName(json['role'] as String),
+      content: json['content'] as String,
+      state: MessageState.values.byName(json['state'] as String? ?? 'done'),
+      timestamp: DateTime.parse(json['timestamp'] as String),
+      generatedSql: json['generatedSql'] as String?,
+      rawData: json['rawData'] as String?,
+    );
+  }
 }

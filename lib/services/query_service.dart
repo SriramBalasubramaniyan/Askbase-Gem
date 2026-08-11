@@ -71,6 +71,7 @@ class QueryService {
     required String question,
     required DatabaseSchema schema,
     required void Function(String token) onToken,
+    List<SqlHistoryTurn> history = const [],
   }) async {
     // ── Step 1: Select relevant tables semantically ─────────────────────────
     final selectedTables = _selector.select(question, schema);
@@ -106,6 +107,7 @@ class QueryService {
           userQuestion: question,
           selectedTables: selectedTables,
           schemaName: schema.databaseName,
+          history: history,
           previousAttemptSql: isRetry ? rawSql : null,
           previousError: isRetry ? lastError : null,
         );

@@ -56,6 +56,25 @@ class SchemaSelector {
     return _withFkDependencies(selected, schema);
   }
 
+  /// The minimum score a table must clear to count as a real match —
+  /// exposed so callers (e.g. the domain-relevance guardrail) can compare
+  /// against the same bar [select] itself uses, without duplicating it.
+  int get minScore => _minScore;
+
+  /// Highest score any single table reaches for [question], or 0 if the
+  /// question tokenizes to nothing (pure stopwords) or matches no table at
+  /// all. Unlike [select] — which always falls back to a handful of
+  /// default tables so SQL generation has *something* to work with — this
+  /// deliberately returns a bare number with no fallback, so it can be used
+  /// as a pre-flight relevance check *before* any LLM call is made.
+  int maxScore(String question, DatabaseSchema schema) {
+    final tokens = _tokenize(question);
+    if (tokens.isEmpty) return 0;
+    final scores = _scoreAllTables(tokens, schema);
+    if (scores.isEmpty) return 0;
+    return scores.values.reduce((a, b) => a > b ? a : b);
+  }
+
   // ── Scoring ───────────────────────────────────────────────────────────────
 
   Map<TableSchema, int> _scoreAllTables(

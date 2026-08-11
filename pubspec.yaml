@@ -1,5 +1,5 @@
 name: askbase_gem
-description: Natural language query interface over any structured SQLite database, powered by an Gemini.
+description: Natural language query interface over any structured SQLite database using Gemini.
 publish_to: 'none'
 version: 1.0.0+1
 

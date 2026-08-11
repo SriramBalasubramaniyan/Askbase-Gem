@@ -63,8 +63,7 @@ class _ApiKeyScreenState extends State<ApiKeyScreen> {
               Text('One-time setup', style: AppTextStyles.displayLarge),
               const SizedBox(height: 12),
               Text(
-                'AskBase Gem uses the Gemini API to answer questions. Enter a '
-                'Gemini API key to get started.',
+                'AskBase Gem uses the Gemini API to answer questions. Enter a Gemini API key to get started.',
                 style: AppTextStyles.body.copyWith(
                   color: AppColors.textSecondary,
                 ),

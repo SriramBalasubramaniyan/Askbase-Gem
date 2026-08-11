@@ -22,12 +22,16 @@ AskBase Gem: Here's what I found — 5 in total:
 ```
 
 Under the hood:
-1. The schema you define tells the model what tables and columns exist
-2. **SchemaSelector** picks only the relevant tables using keyword scoring
-3. **LlmService** calls the Gemini API to generate a SQLite SELECT query using only those tables
-4. **SqlColumnValidator** deterministically checks the query for hallucinated tables, columns, and enum values *before* it ever touches the database — feeding a specific correction back into a retry if it fails, up to 3 attempts total
-5. The query runs against the local database (with a case-insensitivity safety net — see below)
-6. **QueryService** builds the final answer directly from the returned rows — no LLM involved in this step at all (see "Deterministic answer assembly" below for why)
+1. **GuardrailService** checks the question on-device first — length, repeats, prompt-injection attempts, and whether it's actually about the data at all — before anything is sent anywhere
+2. The schema you define tells the model what tables and columns exist
+3. **SchemaSelector** picks only the relevant tables using keyword scoring
+4. **LlmService** calls the Gemini API to generate a SQLite SELECT query using only those tables, plus a compact summary of recent turns in the current chat so follow-up questions ("what about last month?") resolve correctly
+5. **SqlColumnValidator** deterministically checks the query for hallucinated tables, columns, and enum values *before* it ever touches the database — feeding a specific correction back into a retry if it fails, up to 3 attempts total
+6. The query runs against the local database (with a case-insensitivity safety net — see below)
+7. **QueryService** builds the final answer directly from the returned rows — no LLM involved in this step at all (see "Deterministic answer assembly" below for why)
+8. **ChatHistoryService** saves the exchange to the current conversation, naming it from its first question if this was a new chat
+
+You can keep multiple named conversations at once — tap the history icon to switch between them or start a new one, same as any standard chat app (see "Chat history & multiple conversations" below).
 
 ---
 
@@ -37,32 +41,39 @@ Under the hood:
 User Question
      │
      ▼
+GuardrailService.check()            ← on-device only, zero API calls: length,
+     │                                 exact-repeat, prompt-injection patterns,
+     │                                 and domain-relevance (via SchemaSelector)
+     ├─ blocked → canned response shown, pipeline stops here, 0 tokens spent
+     ▼
 SchemaSelector.select()             ← word-boundary keyword scoring against the
      │                                 full schema, with generic-token dampening;
      │                                 returns a handful of relevant tables + FK deps
      ▼
 ┌─── Self-correction loop (1 initial attempt + up to 2 retries) ──────────────┐
-│                                                                             │
+│                                                                              │
 │   LlmService.generateSql()         ← the only model call in the pipeline;   │
-│        │                             a single Gemini API request per        │
-│        │                             attempt                                │
+│        │                             a single Gemini API request per       │
+│        │                             attempt, with compact recent-turn      │
+│        │                             history (question + SQL only) for     │
+│        │                             resolving follow-up references        │
 │        ▼                                                                    │
 │   SqlColumnValidator.check()       ← deterministic, no DB I/O: table/column │
 │        │                             existence, undeclared-table detection, │
 │        │                             enum-value validation                  │
 │        ├─ fails → JoinPathFinder builds a literal FROM/JOIN skeleton if the │
-│        │          failure involves two unrelated tables, appends it to the  │
-│        │          error, retries with that context                          │
+│        │          failure involves two unrelated tables, appends it to the │
+│        │          error, retries with that context                         │
 │        ▼                                                                    │
 │   DbService.validateSql()          ← SELECT-only safety check               │
 │        │                                                                    │
 │        ▼                                                                    │
 │   DbService.runSelect()            ← sqflite; text comparisons rewritten    │
 │        │                             to COLLATE NOCASE                      │
-│        ├─ fails → real SQLite error fed back into the next retry            │
+│        ├─ fails → real SQLite error fed back into the next retry           │
 │        ▼                                                                    │
 │   Rows                                                                      │
-└─────────────────────────────────────────────────────────────────────────────┘
+└──────────────────────────────────────────────────────────────────────────┘
      │
      ▼
 QueryService._buildDeterministicAnswer()   ← entire answer text (including the
@@ -70,6 +81,11 @@ QueryService._buildDeterministicAnswer()   ← entire answer text (including the
      │                                        rows — no LLM involved
      ▼
 Natural language answer
+     │
+     ▼
+ChatHistoryService.saveMessages()   ← persisted to the current chat session;
+                                       title set from the first question if
+                                       this was a new chat
 ```
 
 ### Semantic schema selection
@@ -156,6 +172,37 @@ Get a free key at [aistudio.google.com/app/apikey](https://aistudio.google.com/a
 
 **Changing your key:** tap the key icon in the chat screen's top bar at any time to clear the stored key and re-enter a new one.
 
+### Guardrails (`GuardrailService`)
+
+Every question passes through `GuardrailService.check()` **before** `QueryService` ever calls `LlmService.generateSql()`. All of it runs on-device, so a blocked question costs zero Gemini requests and zero tokens. Checks run cheapest-first and short-circuit on the first failure:
+
+1. **Empty input** — nothing sent.
+2. **Length cap** (`GuardrailService.maxQuestionLength`, 400 characters) — stops an accidentally-pasted wall of text from becoming an oversized request.
+3. **Exact-repeat guard** — if the question is verbatim identical to the immediately preceding one in this chat, it's rejected with a pointer back to the existing answer instead of re-querying the API for output that would be identical.
+4. **Prompt-injection patterns** — a short list of phrases ("ignore previous instructions", "reveal your prompt", "you are now...", "jailbreak", etc.) is checked before anything else that would otherwise call the model; a match is rejected immediately. This is a cheap first line of defense, not a replacement for the system prompt's own hardening (see below).
+5. **Domain relevance** — reuses `SchemaSelector.maxScore()` (the same scoring `select()` uses to pick tables) to check whether the question actually relates to something in the schema. A question that scores 0 and isn't a short, context-dependent follow-up (≤40 characters, asked right after another question) is rejected outright — e.g. "what's the weather today" never reaches Gemini.
+
+On top of the pre-flight guardrail, two more layers of defense run independently:
+
+- **Send-cooldown** (`GuardrailService.minSendInterval`, 1.2s) — enforced in `AppState.sendMessage()` itself, before the guardrail check even runs. Absorbs accidental double-taps on send silently (no message shown, nothing recorded) rather than firing two identical requests.
+- **System-prompt hardening** — `LlmService`'s system prompt explicitly instructs the model to treat the question and conversation history as data, never as instructions, and to answer `OUT_OF_SCOPE` for anything that tries to override its rules. This is defense-in-depth for whatever the on-device injection-pattern list doesn't catch — it costs one request (not zero, unlike the pre-flight guardrail), but it's the backstop for cases guardrail #4 above doesn't have a pattern for yet.
+
+Other token-reduction choices, alongside the guardrails above:
+- `maxOutputTokens` capped at 200 in every request (SQL for a handful of pre-filtered tables never needs more).
+- `SchemaSelector` still limits every request to a handful of relevant tables regardless of total schema size (see "Semantic schema selection" above) — fewer input tokens per request.
+- Conversation history sent to the model is capped to the last `LlmService.maxHistoryTurns` (3) turns, and only as compact `question + generated SQL` pairs — never the full narrative answer or raw result rows (see "Chat history" below).
+
+### Chat history & multiple conversations
+
+AskBase Gem keeps multiple named conversations, like a standard chat app — not just one running transcript.
+
+- **New chat** — the add-comment icon in the top bar (or "New chat" in the drawer) starts a blank, unsaved draft. It only becomes a real, listed conversation once its first message is actually sent — an empty "New chat" never shows up in the history list, matching how most production chat apps behave.
+- **Chat topic / title** — generated entirely from the conversation's first question, truncated to a word boundary (`ChatHistoryService.titleFromQuestion()`). No model call is involved in naming a chat — this is a deliberate token-saving choice, not a missing feature.
+- **History drawer** — the hamburger icon (top-left, automatically added by Flutter whenever a `Scaffold` has a `drawer`) opens `ChatHistoryDrawer`, listing every saved conversation by title and last-updated time, most recent first. Tapping one loads its full message history; the small × on each row deletes that conversation (with a confirmation dialog).
+- **Persistence** — handled by `ChatHistoryService`, entirely via `shared_preferences` (no new dependency): a lightweight index (id, title, last-updated) is stored separately from each conversation's full message list, so opening the drawer never has to load every conversation into memory — only the index. A conversation's full messages are loaded lazily, only when it's opened.
+- **In-context follow-ups** — asking "what about last month?" right after "list active loans" works because `AppState` builds a compact history of the current chat's prior `question → generated SQL` pairs and passes it to `LlmService.generateSql()`, which includes it in the prompt so the model can resolve the reference. See "Guardrails" above for how this is kept small.
+- **Old-chat pruning** — `ChatHistoryService` automatically drops conversations older than 90 days (and caps total stored chats at 200) the next time the index is saved, so local storage doesn't grow unbounded over long-term use.
+
 ### Database freshness
 
 `DbService.init()` copies the bundled `.db` asset into the app's documents directory, and **re-copies it** (rather than only ever copying once) when:
@@ -203,7 +250,9 @@ askbase_gem/
 │   │
 │   ├── models/
 │   │   ├── db_schema_model.dart       ← FieldDef, TableSchema, DatabaseSchema
-│   │   └── chat_message.dart          ← ChatMessage (includes selectedTableNames)
+│   │   ├── chat_message.dart          ← ChatMessage (JSON-serializable for persistence)
+│   │   └── chat_session.dart          ← ChatSummary — history-drawer list entry
+│   │                                     (id, title, last-updated)
 │   │
 │   ├── schema/
 │   │   └── agri_schema.dart           ← swappable schema definition
@@ -211,29 +260,37 @@ askbase_gem/
 │   ├── services/
 │   │   ├── db_service.dart            ← sqflite access, SQL validation, case-insensitive
 │   │   │                                 rewrite, DB freshness/re-copy logic
-│   │   ├── schema_selector.dart       ← keyword-scoring table selection
+│   │   ├── schema_selector.dart       ← keyword-scoring table selection; also exposes
+│   │   │                                 maxScore() for the domain-relevance guardrail
 │   │   ├── sql_column_validator.dart  ← deterministic table/column/enum-value check
 │   │   ├── join_path_finder.dart      ← BFS over the FK graph for join-path hints
+│   │   ├── guardrail_service.dart     ← pre-flight, on-device checks (length,
+│   │   │                                 exact-repeat, prompt-injection, domain
+│   │   │                                 relevance) — runs before any API call
+│   │   ├── chat_history_service.dart  ← persists the chat index + per-chat messages
+│   │   │                                 via shared_preferences; derives chat titles
 │   │   ├── llm_service.dart           ← Gemini API key storage + SQL generation
 │   │   │                                 (the only model-facing service — no
-│   │   │                                 summarization here anymore)
+│   │   │                                 summarization here anymore), history-aware
 │   │   └── query_service.dart         ← pipeline orchestrator + deterministic
 │   │                                     answer assembly
 │   │
 │   └── ui/
 │       ├── app_theme.dart             ← colors, typography, theme
-│       ├── app_state.dart             ← ChangeNotifier, all app state
+│       ├── app_state.dart             ← ChangeNotifier, all app state — chat
+│       │                                 sessions, guardrail wiring, send-cooldown
 │       ├── screens/
 │       │   ├── splash_screen.dart
 │       │   ├── api_key_screen.dart    ← one-time Gemini API key entry
-│       │   └── chat_screen.dart       ← clear/delete button disabled while a
+│       │   └── chat_screen.dart       ← delete-chat button disabled while a
 │       │                                 response is generating; key icon to
-│       │                                 change the stored API key
+│       │                                 change the stored API key; new-chat icon
 │       └── widgets/
 │           ├── chat_bubble.dart       ← SQL disclosure + debug table panel
 │           ├── input_bar.dart
 │           ├── empty_chat.dart
 │           ├── thinking_indicator.dart
+│           ├── chat_history_drawer.dart ← chat list + new-chat action (Scaffold drawer)
 │           └── error_screen.dart
 ```
 
@@ -337,6 +394,8 @@ Gemini's context window is far larger than this app will ever need, so there's n
 - The database is opened and protected at the query validation layer via `validateSql()`.
 - The Gemini API key is stored on-device via `shared_preferences` in plain text. This is fine for personal or single-user field use; if you're distributing this app to other people's devices, swap `shared_preferences` for `flutter_secure_storage` in `llm_service.dart`.
 - Only the question text and the selected table/column names (never row data) are sent to Google as part of SQL generation. Query *results* never leave the device — the answer is assembled from local database rows in Dart.
+- `GuardrailService` rejects obvious prompt-injection phrasing ("ignore previous instructions", "reveal your prompt", etc.) before a question ever reaches the API, and the system prompt itself instructs the model to treat the question and conversation history as data, never as instructions — two independent layers, since neither one alone is airtight against a sufficiently creative rephrasing.
+- Saved chat history (titles and full conversations, including generated SQL) is stored on-device via `shared_preferences`, same trust level as the API key above.
 
 ---
 
@@ -362,11 +421,20 @@ Gemini's context window is far larger than this app will ever need, so there's n
 - Usually a Gemini API problem, not a SQL problem. Check the `errorDetail` on the result (or the debug log) for the underlying HTTP status:
   - **401 / `API_KEY_INVALID`** — the stored key is wrong or has been revoked. Tap the key icon in the chat screen to re-enter it.
   - **429 / `RESOURCE_EXHAUSTED`** — the free tier's requests-per-minute or requests-per-day limit was hit. Wait (RPM limits clear within a minute; RPD resets at midnight Pacific) or reduce request volume.
-  - **Network error / timeout** — no internet connectivity, or the request exceeded `ApiConfig.requestTimeout` (30s).
+  - **Network error / timeout** — no internet connectivity, or the request exceeded `ApiConfig.requestTimeout` (30s). Unlike the old on-device model, AskBase Gem now needs a live connection for every question.
 
 ### App can't reach Gemini at all
 - Confirm the device has internet access — this is no longer an offline app.
 - Confirm your API key was actually saved: clear it via the key icon and re-enter it.
+
+### "I can only answer questions about the data in this database" for a question that seems on-topic
+- This is `GuardrailService`'s domain-relevance check, not Gemini — it means `SchemaSelector.maxScore()` found no table/column match for the question (and it also didn't qualify as a short context-dependent follow-up). Try rephrasing with a term closer to an actual table/field name or description; if it keeps happening for genuinely on-topic questions, the schema's field descriptions may need more specific wording (see "Wrong tables selected" above — the same scoring is used for both).
+
+### A question was rejected with "I can't follow instructions that change how I operate"
+- The question matched one of `GuardrailService`'s prompt-injection patterns (phrases like "ignore previous instructions", "reveal your prompt", "you are now..."). This check has no awareness of intent — a genuine question that happens to contain one of these phrases (rare, but possible) will also be blocked. Rephrase without that wording.
+
+### My question was silently ignored (nothing happened)
+- Likely the send-cooldown (`GuardrailService.minSendInterval`, 1.2s) absorbing an accidental double-tap on send — by design, this case shows no message at all. Wait a moment and send again.
 
 ---
 
@@ -377,6 +445,9 @@ Gemini's context window is far larger than this app will ever need, so there's n
 - **Repeated identical mistakes on retry.** The self-correction loop feeds back a specific, accurate error, but the model doesn't always act on it — occasionally it repeats the exact same wrong column/table name across all 3 attempts even when told precisely what the correct one is. `SqlColumnValidator` and `JoinPathFinder` measurably reduce how often this happens (especially for join-path reasoning), but don't eliminate it. Treat repeated "couldn't come up with a working query" failures on a specific question as a signal worth investigating via the debug log, not always a bug in the validation layer.
 - **`IN (...)` lists aren't case-normalized or enum-checked.** Both `COLLATE NOCASE` rewriting and enum-value validation currently only cover direct `=`/`!=`/`<>` string comparisons.
 - **Deterministic answers favor correctness over natural phrasing.** Since the answer text is built entirely in Dart rather than paraphrased by the model, multi-row answers read as a structured list ("Here's what I found — 5 in total: ...") rather than free-form prose. This was a deliberate trade after LLM-generated summaries proved unreliable — see "Deterministic answer assembly" above.
+- **The domain-relevance guardrail is heuristic, not semantic.** It reuses `SchemaSelector`'s keyword scoring, so a genuinely on-topic question phrased with none of the schema's vocabulary can be rejected before it ever reaches Gemini (a false rejection costs nothing, but is still a UX rough edge — see Troubleshooting above).
+- **The prompt-injection filter is a short, pattern-level list**, not a general-purpose jailbreak detector — it catches common phrasings, not every way to phrase an override attempt. The system prompt's own hardening is the deeper backstop, not this list.
+- **Chat titles never update after creation.** A title is fixed from the conversation's first question and doesn't change even if the conversation's topic drifts significantly in later turns — there's no rename option currently.
 
 ---
 
@@ -390,10 +461,18 @@ Gemini's context window is far larger than this app will ever need, so there's n
 | `provider` | ^6.1.2 | State management |
 | `google_fonts` | ^6.3.3 | DM Sans |
 | `flutter_markdown` | ^0.7.3 | Markdown rendering (bullet lists in answers) |
-| `shared_preferences` | ^2.2.3 | Gemini API key storage, DB freshness tracking |
-| `intl` | ^0.19.0 | Timestamp formatting |
+| `shared_preferences` | ^2.2.3 | Gemini API key storage, DB freshness tracking, chat history persistence |
+| `intl` | ^0.19.0 | Timestamp formatting, chat history date labels |
 
-All validation logic (`SqlColumnValidator`, `JoinPathFinder`) is plain Dart with no additional package dependencies.
+All validation and guardrail logic (`SqlColumnValidator`, `JoinPathFinder`, `GuardrailService`, `ChatHistoryService`) is plain Dart with no additional package dependencies beyond what's listed above.
+
+---
+
+## Flutter SDK
+
+**Required: Flutter 3.41.1 (stable), Dart 3.8.x**
+
+No native ABI constraints or minSdk requirements beyond Flutter's own defaults — there's no on-device inference runtime anymore, so any Android/iOS target Flutter itself supports will work.
 
 ---
 

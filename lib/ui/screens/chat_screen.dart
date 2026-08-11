@@ -1,12 +1,14 @@
 import 'package:askbase_gem/models/chat_message.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+
 import '../app_state.dart';
 import '../app_theme.dart';
 import '../widgets/chat_bubble.dart';
 import '../widgets/input_bar.dart';
 import '../widgets/empty_chat.dart';
 import '../widgets/thinking_indicator.dart';
+import '../widgets/chat_history_drawer.dart';
 
 class ChatScreen extends StatefulWidget {
   const ChatScreen({super.key});
@@ -54,6 +56,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
     return Scaffold(
       backgroundColor: AppColors.surface,
+      drawer: const ChatHistoryDrawer(),
       appBar: _buildAppBar(context, state),
       body: Column(
         children: [
@@ -128,6 +131,12 @@ class _ChatScreenState extends State<ChatScreen> {
       ),
       actions: [
         IconButton(
+          icon: const Icon(Icons.add_comment_outlined, size: 20),
+          color: AppColors.textSecondary,
+          tooltip: 'New chat',
+          onPressed: state.isProcessing ? null : () => state.createNewChat(),
+        ),
+        IconButton(
           icon: const Icon(Icons.vpn_key_outlined, size: 20),
           color: AppColors.textSecondary,
           tooltip: 'Change API key',
@@ -149,7 +158,7 @@ class _ChatScreenState extends State<ChatScreen> {
                 : AppColors.textSecondary,
             tooltip: state.isProcessing
                 ? 'Wait for the response to finish'
-                : 'Clear chat',
+                : 'Delete chat',
             onPressed:
                 state.isProcessing ? null : () => _confirmClear(context, state),
           ),
@@ -178,10 +187,11 @@ class _ChatScreenState extends State<ChatScreen> {
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text('Clear conversation?', style: AppTextStyles.heading),
+            Text('Delete this chat?', style: AppTextStyles.heading),
             const SizedBox(height: 8),
             Text(
-              'All messages will be removed. The database and model stay intact.',
+              'This conversation will be removed from your chat history. '
+              'The database and your other chats stay intact.',
               style: AppTextStyles.bodySecondary,
             ),
             const SizedBox(height: 24),
@@ -215,7 +225,7 @@ class _ChatScreenState extends State<ChatScreen> {
                           borderRadius: BorderRadius.circular(12)),
                       padding: const EdgeInsets.symmetric(vertical: 14),
                     ),
-                    child: const Text('Clear'),
+                    child: const Text('Delete'),
                   ),
                 ),
               ],
