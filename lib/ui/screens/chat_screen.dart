@@ -131,7 +131,7 @@ class _ChatScreenState extends State<ChatScreen> {
       ),
       actions: [
         IconButton(
-          icon: const Icon(Icons.add_comment_outlined, size: 20),
+          icon: const Icon(Icons.add, size: 20),
           color: AppColors.textSecondary,
           tooltip: 'New chat',
           onPressed: state.isProcessing ? null : () => state.createNewChat(),

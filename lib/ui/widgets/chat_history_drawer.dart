@@ -38,11 +38,10 @@ class ChatHistoryDrawer extends StatelessWidget {
                   state.createNewChat();
                   Navigator.of(context).pop();
                 },
-                icon: const Icon(Icons.add_rounded, size: 18),
-                label: const Text('New chat'),
+                label: const Center(child: Text('New chat')),
                 style: OutlinedButton.styleFrom(
                   foregroundColor: AppColors.accent,
-                  side: BorderSide(color: AppColors.accentDim),
+                  side: const BorderSide(color: AppColors.accentDim),
                   padding: const EdgeInsets.symmetric(vertical: 12),
                   shape: RoundedRectangleBorder(
                     borderRadius: BorderRadius.circular(12),
