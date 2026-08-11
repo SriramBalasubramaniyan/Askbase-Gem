@@ -51,29 +51,29 @@ SchemaSelector.select()             ← word-boundary keyword scoring against th
      │                                 returns a handful of relevant tables + FK deps
      ▼
 ┌─── Self-correction loop (1 initial attempt + up to 2 retries) ──────────────┐
-│                                                                              │
+│                                                                             │
 │   LlmService.generateSql()         ← the only model call in the pipeline;   │
-│        │                             a single Gemini API request per       │
+│        │                             a single Gemini API request per        │
 │        │                             attempt, with compact recent-turn      │
-│        │                             history (question + SQL only) for     │
-│        │                             resolving follow-up references        │
+│        │                             history (question + SQL only) for      │
+│        │                             resolving follow-up references         │
 │        ▼                                                                    │
 │   SqlColumnValidator.check()       ← deterministic, no DB I/O: table/column │
 │        │                             existence, undeclared-table detection, │
 │        │                             enum-value validation                  │
 │        ├─ fails → JoinPathFinder builds a literal FROM/JOIN skeleton if the │
-│        │          failure involves two unrelated tables, appends it to the │
-│        │          error, retries with that context                         │
+│        │          failure involves two unrelated tables, appends it to the  │
+│        │          error, retries with that context                          │
 │        ▼                                                                    │
 │   DbService.validateSql()          ← SELECT-only safety check               │
 │        │                                                                    │
 │        ▼                                                                    │
 │   DbService.runSelect()            ← sqflite; text comparisons rewritten    │
 │        │                             to COLLATE NOCASE                      │
-│        ├─ fails → real SQLite error fed back into the next retry           │
+│        ├─ fails → real SQLite error fed back into the next retry            │
 │        ▼                                                                    │
 │   Rows                                                                      │
-└──────────────────────────────────────────────────────────────────────────┘
+└─────────────────────────────────────────────────────────────────────────────┘
      │
      ▼
 QueryService._buildDeterministicAnswer()   ← entire answer text (including the
