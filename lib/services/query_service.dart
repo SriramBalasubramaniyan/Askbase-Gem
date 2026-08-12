@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:developer' as developer;
 import 'package:flutter/foundation.dart';
+import 'package:intl/intl.dart';
 
 import '../models/db_schema_model.dart';
 import '../services/db_service.dart';
@@ -83,7 +84,7 @@ class QueryService {
     }
 
     final debugTables =
-        kDebugMode ? selectedTables.map((t) => t.tableName).toList() : null;
+    kDebugMode ? selectedTables.map((t) => t.tableName).toList() : null;
 
     // ── Steps 2-5: generate → check → validate → execute, with
     // self-correction ─────────────────────────────────────────────────────
@@ -121,7 +122,7 @@ class QueryService {
           return QueryResult(
             status: QueryResultStatus.llmError,
             summary:
-                'The AI model encountered an error while generating a '
+            'The AI model encountered an error while generating a '
                 'query. Please try again.',
             errorDetail: lastError,
             selectedTableNames: debugTables,
@@ -138,7 +139,7 @@ class QueryService {
         return QueryResult(
           status: QueryResultStatus.outOfScope,
           summary:
-              'I can only answer questions about the data in this database. '
+          'I can only answer questions about the data in this database. '
               'Please ask something related to the available records.',
           selectedTableNames: debugTables,
         );
@@ -148,7 +149,7 @@ class QueryService {
         return QueryResult(
           status: QueryResultStatus.cannotAnswer,
           summary:
-              'The information you asked for is not available in this database.',
+          'The information you asked for is not available in this database.',
           selectedTableNames: debugTables,
         );
       }
@@ -267,15 +268,18 @@ class QueryService {
   ///      the whole result (e.g. a "status" column alone, all "Pending")
   ///      → a similar fallback — technically not empty, but equally
   ///      useless for telling the results apart.
-  ///   4. Otherwise → a short deterministic lead-in, then every row
-  ///      rendered as one bullet each from its non-ID columns in the
-  ///      order the query selected them. A single row is rendered as a
-  ///      plain sentence rather than a one-item bullet list.
+  ///   4. Otherwise → a short deterministic lead-in, then rows rendered
+  ///      with each column labeled ("Sanctioned amount: 333377.21", not
+  ///      a bare comma-joined value) and formatted (numbers rounded to
+  ///      2dp with floating-point noise trimmed, YYYY-MM-DD dates spelled
+  ///      out) — see [_labeledPairs]. A single row gets one bullet per
+  ///      field; multiple rows get one bullet per row, fields joined by
+  ///      " · " so the list stays scannable.
   String _buildDeterministicAnswer(
-    List<Map<String, dynamic>> rows,
-    String? sql,
-    DatabaseSchema schema,
-  ) {
+      List<Map<String, dynamic>> rows,
+      String? sql,
+      DatabaseSchema schema,
+      ) {
     if (rows.length == 1 && rows.first.length == 1) {
       final rawKey = rows.first.keys.first;
       final match = _aggregatePattern.firstMatch(rawKey.trim());
@@ -283,8 +287,8 @@ class QueryService {
         final primaryTable = sql == null
             ? null
             : SqlColumnValidator.referencedTables(sql, schema)
-                .map((t) => t.tableName)
-                .firstOrNull;
+            .map((t) => t.tableName)
+            .firstOrNull;
         return _aggregateSentence(
           match.group(1)!.toUpperCase(),
           match.group(2),
@@ -295,7 +299,6 @@ class QueryService {
     }
 
     final displayRows = rows.map(_stripIdColumns).toList();
-    final rowStrings = displayRows.map((r) => r.values.join(', ')).toList();
 
     final allEmpty = displayRows.every((r) => r.isEmpty);
     if (allEmpty) {
@@ -304,23 +307,104 @@ class QueryService {
           'asking for specific columns (e.g. names, amounts, or dates).';
     }
 
+    final labeledRows = displayRows.map(_labeledPairs).toList();
+    final joinedRows = labeledRows.map((pairs) => pairs.join(' · ')).toList();
+
     final allIdentical =
-        rows.length > 1 && rowStrings.toSet().length == 1;
+        rows.length > 1 && joinedRows.toSet().length == 1;
     if (allIdentical) {
-      return 'There are ${rows.length} matching record(s), but the only '
-          'value returned ("${rowStrings.first}") is the same for every '
-          'one and doesn\'t distinguish them. Try asking for specific '
+      return 'There are ${rows.length} matching record(s), but the '
+          'details returned ("${joinedRows.first}") are the same for '
+          'every one and don\'t distinguish them. Try asking for specific '
           'columns (e.g. names, amounts, or dates) so each result can be '
           'told apart.';
     }
 
     if (rows.length == 1) {
-      return 'Here\'s what I found:\n\n${rowStrings.first}.';
+      final bullets = labeledRows.first.map((p) => '- $p').join('\n');
+      return 'Here\'s what I found:\n\n$bullets';
     }
 
-    final bullets = rowStrings.map((s) => '- $s').join('\n');
+    final bullets = joinedRows.map((s) => '- $s').join('\n');
     return 'Here\'s what I found — ${rows.length} in total:\n$bullets';
   }
+
+  /// Renders [row] as "Label: formatted value" pairs, one per column, in
+  /// the order the query selected them — see [_humanizeColumnLabel] and
+  /// [_formatValue].
+  List<String> _labeledPairs(Map<String, dynamic> row) {
+    return row.entries
+        .map((e) =>
+    '${_humanizeColumnLabel(e.key)}: ${_formatValue(e.value)}')
+        .toList();
+  }
+
+  /// Turns a raw SQL result-column name into a readable label:
+  /// "sanctioned_amount" → "Sanctioned amount", "T1.name" → "Name". An
+  /// unaliased aggregate expression like "SUM(quantity_kg)" (the model
+  /// doesn't always add `AS`) is recognized and humanized the same way
+  /// [_aggregateSentence] phrases it in prose — "Total quantity kg" —
+  /// instead of being shown as a raw function call.
+  String _humanizeColumnLabel(String rawKey) {
+    final key = rawKey.trim();
+    final match = _aggregatePattern.firstMatch(key);
+    if (match != null) {
+      final fn = match.group(1)!.toUpperCase();
+      final verb = const {
+        'COUNT': 'count',
+        'SUM': 'total',
+        'AVG': 'average',
+        'MIN': 'minimum',
+        'MAX': 'maximum',
+      }[fn]!;
+      final argLabel = _humanizeAggregateArg(match.group(2));
+      return _capitalize(argLabel != null ? '$verb $argLabel' : verb);
+    }
+    final column = key.contains('.') ? key.split('.').last : key;
+    return _capitalize(column.replaceAll('_', ' '));
+  }
+
+  /// Formats a single cell value for display:
+  ///  - `null` → an em dash, so it's visibly a gap rather than blank space.
+  ///  - Numbers → rounded to 2 decimal places with trailing zeros trimmed,
+  ///    so floating-point noise like `4793.450000000001` reads as
+  ///    `4793.45` and whole numbers like `100.0` read as `100`, not
+  ///    `100.00`.
+  ///  - Strings matching `YYYY-MM-DD` (this schema's date convention,
+  ///    documented in every date field) → spelled out ("10 Oct 2022")
+  ///    instead of shown as raw ISO text.
+  ///  - Anything else → shown as-is.
+  String _formatValue(dynamic value) {
+    if (value == null) return '—';
+    if (value is num) return _formatNumber(value);
+    if (value is String) {
+      final trimmed = value.trim();
+      if (trimmed.isEmpty) return '—';
+      if (_isoDatePattern.hasMatch(trimmed)) {
+        final parsed = DateTime.tryParse(trimmed);
+        if (parsed != null) return DateFormat('d MMM yyyy').format(parsed);
+      }
+      return trimmed;
+    }
+    return value.toString();
+  }
+
+  static final RegExp _isoDatePattern = RegExp(r'^\d{4}-\d{2}-\d{2}$');
+
+  /// Rounds to 2 decimal places and trims trailing fractional zeros —
+  /// `4793.450000000001` → `4793.45`, `302.40` → `302.4`, `100.0` → `100`.
+  /// Integers pass through unchanged.
+  String _formatNumber(num n) {
+    if (n is int) return n.toString();
+    var s = n.toStringAsFixed(2);
+    if (s.contains('.')) {
+      s = s.replaceFirst(RegExp(r'0+$'), '').replaceFirst(RegExp(r'\.$'), '');
+    }
+    return s;
+  }
+
+  String _capitalize(String s) =>
+      s.isEmpty ? s : '${s[0].toUpperCase()}${s.substring(1)}';
 
   /// Returns a copy of [row] with any key named "id" or ending in "_id"
   /// removed — these are reference numbers, not meaningful content, and
@@ -344,11 +428,11 @@ class QueryService {
   /// neither is available (e.g. a bare `COUNT(*)` with no resolvable
   /// table, which shouldn't normally happen but is handled safely).
   String _aggregateSentence(
-    String fn,
-    String? arg,
-    String? tableName,
-    dynamic value,
-  ) {
+      String fn,
+      String? arg,
+      String? tableName,
+      dynamic value,
+      ) {
     switch (fn) {
       case 'COUNT':
         if (tableName != null) {
@@ -413,10 +497,10 @@ class QueryService {
   /// the next generation attempt can copy it directly instead of having to
   /// assemble a multi-hop join from separate facts on its own.
   String _withJoinPathHint(
-    String baseError,
-    String sql,
-    DatabaseSchema schema,
-  ) {
+      String baseError,
+      String sql,
+      DatabaseSchema schema,
+      ) {
     final tables = SqlColumnValidator.referencedTables(sql, schema);
     if (tables.length < 2) return baseError;
 
@@ -427,9 +511,9 @@ class QueryService {
         final b = tables[j];
 
         final directlyLinked = a.fields
-                .any((f) => f.foreignKeyRef?.startsWith('${b.tableName}.') ?? false) ||
+            .any((f) => f.foreignKeyRef?.startsWith('${b.tableName}.') ?? false) ||
             b.fields.any(
-                (f) => f.foreignKeyRef?.startsWith('${a.tableName}.') ?? false);
+                    (f) => f.foreignKeyRef?.startsWith('${a.tableName}.') ?? false);
         if (directlyLinked) continue;
 
         final path = JoinPathFinder.findPath(schema, a.tableName, b.tableName);

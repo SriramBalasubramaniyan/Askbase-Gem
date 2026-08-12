@@ -117,17 +117,21 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Deletes [chatId]. If it was the chat currently open, this always
+  /// lands on a blank draft ("home") — never on whatever chat happens to
+  /// be next in the list. Auto-loading a different saved chat after a
+  /// delete is exactly the "stack pop" behavior production chat apps
+  /// avoid: deleting is a destructive action on *this* conversation, not
+  /// a request to resume a different one the user didn't choose.
   Future<void> deleteChat(String chatId) async {
     if (_isProcessing) return;
+    final wasCurrent = chatId == _currentChatId;
+
     _chatIndex = _chatIndex.where((c) => c.id != chatId).toList();
     await _history.saveIndex(_chatIndex);
     await _history.deleteChat(chatId);
 
-    if (chatId == _currentChatId) {
-      if (_chatIndex.isNotEmpty) {
-        await switchChat(_chatIndex.first.id);
-        return;
-      }
+    if (wasCurrent) {
       _currentChatId = null;
       _messages.clear();
     }
@@ -149,7 +153,8 @@ class AppState extends ChangeNotifier {
 
   /// Kept for the existing "clear chat" action in the chat screen — clears
   /// just the currently open conversation (and deletes it from history if
-  /// it was already saved), without touching other saved chats.
+  /// it was already saved), without touching other saved chats. Always
+  /// lands on a blank draft — see [deleteChat].
   Future<void> clearChat() async {
     if (_isProcessing) return;
     if (_currentChatId != null) {
@@ -222,10 +227,10 @@ class AppState extends ChangeNotifier {
     // deliberately left out — see SqlHistoryTurn.
     final sqlHistory = _messages
         .where((m) =>
-            m.isAssistant &&
-            m.state == MessageState.done &&
-            m.generatedSql != null &&
-            m.generatedSql!.isNotEmpty)
+    m.isAssistant &&
+        m.state == MessageState.done &&
+        m.generatedSql != null &&
+        m.generatedSql!.isNotEmpty)
         .map((m) {
       final idx = _messages.indexOf(m);
       final priorUser = idx > 0 ? _messages[idx - 1] : null;
@@ -298,13 +303,13 @@ class AppState extends ChangeNotifier {
   }
 
   void _updateAssistantMessage(
-    String id, {
-    required String content,
-    required MessageState state,
-    String? generatedSql,
-    String? rawData,
-    List<String>? selectedTableNames,
-  }) {
+      String id, {
+        required String content,
+        required MessageState state,
+        String? generatedSql,
+        String? rawData,
+        List<String>? selectedTableNames,
+      }) {
     final idx = _messages.indexWhere((m) => m.id == id);
     if (idx == -1) return;
     _messages[idx] = _messages[idx].copyWith(
@@ -336,7 +341,7 @@ class AppState extends ChangeNotifier {
     } else {
       _chatIndex = _chatIndex
           .map((c) =>
-              c.id == chatId ? c.copyWith(updatedAt: DateTime.now()) : c)
+      c.id == chatId ? c.copyWith(updatedAt: DateTime.now()) : c)
           .toList()
         ..sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
     }

@@ -38,7 +38,8 @@ class ChatHistoryDrawer extends StatelessWidget {
                   state.createNewChat();
                   Navigator.of(context).pop();
                 },
-                label: const Center(child: Text('New chat')),
+                icon: const Icon(Icons.add_rounded, size: 18),
+                label: const Text('New chat'),
                 style: OutlinedButton.styleFrom(
                   foregroundColor: AppColors.accent,
                   side: const BorderSide(color: AppColors.accentDim),
@@ -58,32 +59,32 @@ class ChatHistoryDrawer extends StatelessWidget {
             Expanded(
               child: state.chatIndex.isEmpty
                   ? Center(
-                      child: Padding(
-                        padding: const EdgeInsets.all(24),
-                        child: Text(
-                          'Your past conversations will show up here.',
-                          textAlign: TextAlign.center,
-                          style: AppTextStyles.bodySecondary,
-                        ),
-                      ),
-                    )
+                child: Padding(
+                  padding: const EdgeInsets.all(24),
+                  child: Text(
+                    'Your past conversations will show up here.',
+                    textAlign: TextAlign.center,
+                    style: AppTextStyles.bodySecondary,
+                  ),
+                ),
+              )
                   : ListView.builder(
-                      padding: const EdgeInsets.symmetric(vertical: 8),
-                      itemCount: state.chatIndex.length,
-                      itemBuilder: (context, index) {
-                        final chat = state.chatIndex[index];
-                        final isActive = chat.id == state.currentChatId;
-                        return _ChatTile(
-                          chat: chat,
-                          isActive: isActive,
-                          onTap: () {
-                            state.switchChat(chat.id);
-                            Navigator.of(context).pop();
-                          },
-                          onDelete: () => _confirmDelete(context, state, chat),
-                        );
-                      },
-                    ),
+                padding: const EdgeInsets.symmetric(vertical: 8),
+                itemCount: state.chatIndex.length,
+                itemBuilder: (context, index) {
+                  final chat = state.chatIndex[index];
+                  final isActive = chat.id == state.currentChatId;
+                  return _ChatTile(
+                    chat: chat,
+                    isActive: isActive,
+                    onTap: () {
+                      state.switchChat(chat.id);
+                      Navigator.of(context).pop();
+                    },
+                    onDelete: () => _confirmDelete(context, state, chat),
+                  );
+                },
+              ),
             ),
           ],
         ),
@@ -166,7 +167,7 @@ class _ChatTile extends StatelessWidget {
                             ? AppColors.textPrimary
                             : AppColors.textSecondary,
                         fontWeight:
-                            isActive ? FontWeight.w600 : FontWeight.w400,
+                        isActive ? FontWeight.w600 : FontWeight.w400,
                       ),
                     ),
                     const SizedBox(height: 2),

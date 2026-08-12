@@ -107,15 +107,15 @@ class LlmService {
 
     final userText = isRetry
         ? '$historyBlock'
-            'Question: $userQuestion\n\n'
-            'Your previous SQL failed to run:\n$previousAttemptSql\n\n'
-            'Error: $previousError\n\n'
-            'Fix the query using the exact information in the error above. '
-            'Use ONLY the exact table and column names listed in SCHEMA — '
-            'do not invent or guess a name that isn\'t there. If the error '
-            'gives you a join structure to use, copy it exactly as given — '
-            'do not modify it. If no valid query is possible, output '
-            'CANNOT_ANSWER.\n\nSQL:'
+        'Question: $userQuestion\n\n'
+        'Your previous SQL failed to run:\n$previousAttemptSql\n\n'
+        'Error: $previousError\n\n'
+        'Fix the query using the exact information in the error above. '
+        'Use ONLY the exact table and column names listed in SCHEMA — '
+        'do not invent or guess a name that isn\'t there. If the error '
+        'gives you a join structure to use, copy it exactly as given — '
+        'do not modify it. If no valid query is possible, output '
+        'CANNOT_ANSWER.\n\nSQL:'
         : '${historyBlock}Question: $userQuestion\n\nSQL:';
 
     final uri = Uri.parse(
@@ -150,13 +150,13 @@ class LlmService {
     try {
       response = await http
           .post(
-            uri,
-            headers: {
-              'Content-Type': 'application/json',
-              'x-goog-api-key': apiKey,
-            },
-            body: body,
-          )
+        uri,
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': apiKey,
+        },
+        body: body,
+      )
           .timeout(ApiConfig.requestTimeout);
     } catch (e) {
       throw StateError('Network error while contacting Gemini: $e');
@@ -224,12 +224,21 @@ class LlmService {
         'those exact values verbatim — never a similar-sounding or '
         'invented value. Never add a WHERE condition on a specific value '
         'the user did not ask for. '
+        'If a column\'s description reads like "1 if X, 0 if Y" or "1 if '
+        'X, 0 otherwise", it\'s a boolean flag stored as an integer — '
+        'compare it to the integer 1 or 0 (e.g. attended = 1), never a '
+        'text value like \'Yes\'/\'No\'/\'True\'/\'False\'. '
         'For questions using "most", "least", "highest", "lowest", "top", '
         'or "best", ORDER BY (or use MAX()/MIN() on) the column that '
         'actually measures that quantity (an amount, quantity, price, or '
         'count column) — never an ID column. Sorting or taking MAX/MIN of '
         'an ID column does not mean "the most" or "the least" of anything '
-        'real. '
+        'real. If the question asks for a single specific entity via this '
+        'kind of superlative wording (e.g. "which farmer harvested the '
+        'most", "the highest-value loan") and does not ask for a list, '
+        'several results, or a specific "top N", use LIMIT 1 so exactly '
+        'one row comes back — not the default 100. Only use a larger '
+        'LIMIT when the question explicitly asks for multiple results. '
         'Only JOIN a table if you need a column from it. If you do JOIN a '
         'table, SELECT its name or other descriptive column — never join a '
         'table and then use nothing from it. '
