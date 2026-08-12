@@ -12,13 +12,22 @@ AskBase Gem lets you ask plain-language questions about a SQLite database and ge
 User:        How many farmers are registered?
 AskBase Gem: There are 30 farmers.
 
+User:        Which farmer harvested the most kg?
+AskBase Gem: Here's what I found:
+
+             Name: Thiru Murugan
+             Phone: 9695593601
+             Gender: Female
+             Address: 34 Main Street
+             Total quantity kg: 4793.45
+
 User:        List all active loans
 AskBase Gem: Here's what I found — 5 in total:
-             - Term Loan, 333377.21, Active
-             - KCC, 191641.95, Active
-             - Term Loan, 365264.69, Active
-             - Cooperative Loan, 451653.32, Active
-             - Cooperative Loan, 477099.92, Active
+             - Loan type: KCC · Sanctioned amount: 192516.55 · Disbursed amount: 333377.21 · Status: Active
+             - Loan type: KCC · Sanctioned amount: 276691.76 · Disbursed amount: 191641.95 · Status: Active
+             - Loan type: Term Loan · Sanctioned amount: 334352.53 · Disbursed amount: 365264.69 · Status: Active
+             - Loan type: Cooperative Loan · Sanctioned amount: 239081.17 · Disbursed amount: 451653.32 · Status: Active
+             - Loan type: Cooperative Loan · Sanctioned amount: 129031.85 · Disbursed amount: 477099.92 · Status: Active
 ```
 
 Under the hood:
@@ -150,10 +159,19 @@ What `_buildDeterministicAnswer` actually does with the rows:
 
 - **Single aggregate value** (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX` on one row, one column) → a complete sentence using the *real* table name (for `COUNT`, with correct singular/plural: "There are 30 farmers." / "There is 1 farmer.") or the *real* column name (for `SUM`/`AVG`/`MIN`/`MAX`, humanized: "The total disbursed amount is 1250000.5."), both pulled straight out of the generated SQL — not generic "matching records"/"the total" phrasing.
 - **ID columns are always stripped** from displayed rows (any field named `id` or ending in `_id`) — never surfaced unless the user explicitly asked for one.
-- **If every row is left with nothing after ID-stripping**, or **every remaining row is identical** (e.g. a lone `status` column that just says "Pending" 11 times), an explicit fallback message is returned instead of a misleadingly confident answer — which doubles as a visible signal that the generated SQL under-selected columns, rather than silently glossing over it.
-- **Otherwise**, one row → a plain sentence; multiple rows → a markdown bullet list, one bullet per row, with **no artificial cap** — every row the query returns is shown.
+- **Every remaining column gets a readable label**, not a raw SQL result-column name — `sanctioned_amount` → "Sanctioned amount", `T1.name` → "Name". This also handles the case where the model skips the `AS` alias on an aggregate (`SUM(quantity_kg)` shows up as-is in raw SQLite results) — that's recognized and humanized the same way an aggregate sentence is: "Total quantity kg", not the raw function call.
+- **Values are formatted, not dumped raw**: numbers are rounded to 2 decimal places with floating-point noise trimmed (`4793.450000000001` → `4793.45`, `100.0` → `100`), and any `YYYY-MM-DD` string is spelled out (`2022-10-10` → `10 Oct 2022`).
+- **If every row is left with nothing after ID-stripping**, or **every remaining row's labeled details are identical** (e.g. a lone `status` column that just says "Pending" 11 times), an explicit fallback message is returned instead of a misleadingly confident answer — which doubles as a visible signal that the generated SQL under-selected columns, rather than silently glossing over it.
+- **Otherwise**: a single row renders as one labeled line per field (like a small profile card — `Name: ...`, `Phone: ...`, `Total quantity kg: ...`, one per line); multiple rows render as a markdown bullet list, one bullet per row with its fields joined by `·` so the list stays scannable (`- Loan type: KCC · Sanctioned amount: 192516.55 · Status: Active`) — with **no artificial cap** on row count, every row the query returns is shown.
 
 `LlmService` has exactly one model-facing method: `generateSql()`. There is no `summarizeResults()` or results-lead-in generator anymore.
+
+### Query-shape correctness rules
+
+Two rules live directly in `LlmService`'s system prompt to fix shapes the model got wrong often enough in practice to be worth naming explicitly, rather than leaving to general "write good SQL" instructions:
+
+- **Singular superlatives get `LIMIT 1`.** A question like "which farmer harvested the most kg?" is asking for exactly one entity, not a ranked list — but without an explicit rule, the model would inconsistently pick anywhere from `LIMIT 1` to the default `LIMIT 100` for the same question across runs. The prompt now explicitly ties `LIMIT 1` to superlative wording ("the most", "the highest", "the best", etc.) *unless* the question also asks for a list, several results, or a specific "top N" — those still get the default `LIMIT 100`.
+- **Boolean-as-integer columns are compared as integers.** A field described as `"1 if X, 0 if Y"` or `"1 if X, 0 otherwise"` (this schema's convention for flags like `attended`, `is_active`, `certificate_issued`) is an integer column, not a text status field — but nothing previously told the model that, so it would sometimes guess a string comparison like `attended = 'Yes'`, which matches nothing and silently returns zero rows. The prompt now explicitly calls out this description pattern and requires comparing against the integer `1`/`0` instead.
 
 ### Gemini API
 
@@ -382,9 +400,11 @@ FieldDef(
 
 **For enum/status-style text columns, list the exact stored values in parentheses** — e.g. `"Loan status (Active, Repaid, Overdue, NPA)."` This isn't just documentation: `SqlColumnValidator` parses this exact format (a parenthetical group with 2+ comma-separated items, each under 30 characters) and will reject any generated SQL that compares this column to a value not in that list, before it ever reaches the database. `DbService`'s `COLLATE NOCASE` rewrite separately covers you if the casing doesn't match exactly — the two checks are complementary and don't overlap.
 
+**For boolean flags stored as an integer, write the description as `"1 if X, 0 if Y"` or `"1 if X, 0 otherwise"`** — e.g. `"1 if farmer attended, 0 if absent."` `LlmService`'s system prompt recognizes this exact phrasing and tells the model to compare the column against the integer `1`/`0`, not a text value — without it, the model has been observed guessing `'Yes'`/`'No'`-style string comparisons against a genuinely integer column, which silently return zero rows since that value never exists in the data.
+
 ### Token budget
 
-Gemini's context window is far larger than this app will ever need, so there's no hard prompt-fitting limit to design around — but `SchemaSelector` still keeps only a handful of relevant tables in every request, since fewer input tokens means less of the free-tier's per-minute token budget consumed per question. You can safely have 100+ tables in the schema — only the relevant subset is ever sent to the model. `maxOutputTokens` is capped at 300 in `LlmService`, comfortably more than a generated SQL query needs, to keep each response small and fast.
+Gemini's context window is far larger than this app will ever need, so there's no hard prompt-fitting limit to design around — but `SchemaSelector` still keeps only a handful of relevant tables in every request, since fewer input tokens means less of the free-tier's per-minute token budget consumed per question. You can safely have 100+ tables in the schema — only the relevant subset is ever sent to the model. `maxOutputTokens` is capped at 200 in `LlmService`, comfortably more than a generated SQL query needs, to keep each response small and fast.
 
 ---
 
@@ -419,9 +439,9 @@ Gemini's context window is far larger than this app will ever need, so there's n
 
 ### "The AI model encountered an error while generating a query"
 - Usually a Gemini API problem, not a SQL problem. Check the `errorDetail` on the result (or the debug log) for the underlying HTTP status:
-  - **401 / `API_KEY_INVALID`** — the stored key is wrong or has been revoked. Tap the key icon in the chat screen to re-enter it.
-  - **429 / `RESOURCE_EXHAUSTED`** — the free tier's requests-per-minute or requests-per-day limit was hit. Wait (RPM limits clear within a minute; RPD resets at midnight Pacific) or reduce request volume.
-  - **Network error / timeout** — no internet connectivity, or the request exceeded `ApiConfig.requestTimeout` (30s). Unlike the old on-device model, AskBase Gem now needs a live connection for every question.
+    - **401 / `API_KEY_INVALID`** — the stored key is wrong or has been revoked. Tap the key icon in the chat screen to re-enter it.
+    - **429 / `RESOURCE_EXHAUSTED`** — the free tier's requests-per-minute or requests-per-day limit was hit. Wait (RPM limits clear within a minute; RPD resets at midnight Pacific) or reduce request volume.
+    - **Network error / timeout** — no internet connectivity, or the request exceeded `ApiConfig.requestTimeout` (30s). Unlike the old on-device model, AskBase Gem now needs a live connection for every question.
 
 ### App can't reach Gemini at all
 - Confirm the device has internet access — this is no longer an offline app.
@@ -444,10 +464,11 @@ Gemini's context window is far larger than this app will ever need, so there's n
 - **Free-tier rate limits.** `gemini-flash-lite-latest` has the most generous free-tier limits Gemini offers, but they're still finite (requests-per-minute and requests-per-day caps, reset details vary by Google's current published limits). Heavy or bursty use can hit a 429 — see Troubleshooting above.
 - **Repeated identical mistakes on retry.** The self-correction loop feeds back a specific, accurate error, but the model doesn't always act on it — occasionally it repeats the exact same wrong column/table name across all 3 attempts even when told precisely what the correct one is. `SqlColumnValidator` and `JoinPathFinder` measurably reduce how often this happens (especially for join-path reasoning), but don't eliminate it. Treat repeated "couldn't come up with a working query" failures on a specific question as a signal worth investigating via the debug log, not always a bug in the validation layer.
 - **`IN (...)` lists aren't case-normalized or enum-checked.** Both `COLLATE NOCASE` rewriting and enum-value validation currently only cover direct `=`/`!=`/`<>` string comparisons.
-- **Deterministic answers favor correctness over natural phrasing.** Since the answer text is built entirely in Dart rather than paraphrased by the model, multi-row answers read as a structured list ("Here's what I found — 5 in total: ...") rather than free-form prose. This was a deliberate trade after LLM-generated summaries proved unreliable — see "Deterministic answer assembly" above.
+- **Deterministic answers favor correctness over natural phrasing.** Since the answer text is built entirely in Dart rather than paraphrased by the model, multi-row answers read as a labeled, structured list ("Here's what I found — 5 in total: - Loan type: KCC · Status: Active") rather than free-form prose. This was a deliberate trade after LLM-generated summaries proved unreliable — see "Deterministic answer assembly" above.
 - **The domain-relevance guardrail is heuristic, not semantic.** It reuses `SchemaSelector`'s keyword scoring, so a genuinely on-topic question phrased with none of the schema's vocabulary can be rejected before it ever reaches Gemini (a false rejection costs nothing, but is still a UX rough edge — see Troubleshooting above).
 - **The prompt-injection filter is a short, pattern-level list**, not a general-purpose jailbreak detector — it catches common phrasings, not every way to phrase an override attempt. The system prompt's own hardening is the deeper backstop, not this list.
 - **Chat titles never update after creation.** A title is fixed from the conversation's first question and doesn't change even if the conversation's topic drifts significantly in later turns — there's no rename option currently.
+- **Value formatting is heuristic, not type-aware.** `_formatValue` decides how to display a cell purely from its shape: any string matching `YYYY-MM-DD` is treated as a date and spelled out, and every number is rounded to 2 decimal places. A text column that happens to contain a literal `YYYY-MM-DD`-shaped string for a non-date reason would still get reformatted as a date; a numeric ID-like column that wasn't caught by the `_id`/`id` name-based strip (see "Deterministic answer assembly" above) would get rounded like any other number. Neither has come up in practice with this schema's naming conventions, but it's worth knowing if you swap in a very differently-named database.
 
 ---
 
