@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
 import 'package:intl/intl.dart';
+import 'package:markdown/markdown.dart' as md;
 
 import '../../models/chat_message.dart';
 import '../app_theme.dart';
@@ -26,7 +27,7 @@ class _ChatBubbleState extends State<ChatBubble> {
       padding: const EdgeInsets.only(bottom: 12),
       child: Column(
         crossAxisAlignment:
-            isUser ? CrossAxisAlignment.end : CrossAxisAlignment.start,
+        isUser ? CrossAxisAlignment.end : CrossAxisAlignment.start,
         children: [
           Container(
             constraints: BoxConstraints(
@@ -54,9 +55,9 @@ class _ChatBubbleState extends State<ChatBubble> {
                   child: isUser
                       ? Text(msg.content, style: AppTextStyles.body)
                       : _AssistantContent(
-                          content: msg.content,
-                          state: msg.state,
-                        ),
+                    content: msg.content,
+                    state: msg.state,
+                  ),
                 ),
 
                 // ── SQL disclosure (assistant only) ──────────────────────
@@ -106,6 +107,9 @@ class _AssistantContent extends StatelessWidget {
     final isStreaming = state == MessageState.streaming;
     return MarkdownBody(
       data: content + (isStreaming ? ' ▍' : ''),
+      // Needed for table syntax (`| a | b |`) — off by default, since
+      // tables are a GFM extension, not part of base CommonMark.
+      extensionSet: md.ExtensionSet.gitHubFlavored,
       styleSheet: MarkdownStyleSheet(
         p: AppTextStyles.body,
         strong: AppTextStyles.body.copyWith(fontWeight: FontWeight.w700),
@@ -116,6 +120,30 @@ class _AssistantContent extends StatelessWidget {
           borderRadius: BorderRadius.circular(8),
         ),
         listBullet: AppTextStyles.body,
+        // FlexColumnWidth divides the bubble's available width evenly
+        // across columns, so a table can never force the bubble wider
+        // than its constraint or overflow — long cell text wraps onto
+        // multiple lines instead, the same way the rest of the answer
+        // text already does. QueryService only emits a table for results
+        // with a handful of columns (see _maxTableColumns), so this even
+        // division stays reasonable rather than squeezing many columns
+        // into slivers.
+        tableColumnWidth: const FlexColumnWidth(),
+        tableBorder: TableBorder.all(
+          color: AppColors.textMuted.withOpacity(0.25),
+          width: 1,
+          borderRadius: BorderRadius.circular(6),
+        ),
+        tableHead: AppTextStyles.body.copyWith(
+          fontWeight: FontWeight.w700,
+          fontSize: 13,
+        ),
+        tableBody: AppTextStyles.body.copyWith(fontSize: 13),
+        tableCellsPadding: const EdgeInsets.symmetric(
+          horizontal: 8,
+          vertical: 6,
+        ),
+        tableHeadAlign: TextAlign.left,
       ),
     );
   }

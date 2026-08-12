@@ -58,6 +58,13 @@ class QueryService {
   static const int _maxRetries = 2;
   static const int _maxAttempts = _maxRetries + 1;
 
+  /// Multi-row results with more fields per row than this render as a
+  /// numbered card (one field per line) instead of a single `·`-joined
+  /// line — see [_buildDeterministicAnswer]. A dot-joined line still
+  /// reads fine at 2-3 fields; beyond that it wraps into an unreadable
+  /// wall of text in a phone-width chat bubble.
+  static const int _wideRowFieldThreshold = 3;
+
   /// Matches the sole column of a single-row/single-column result against
   /// an aggregate function shape, capturing the function name and its
   /// argument (a column reference, `*`, or nothing) separately — the
@@ -268,13 +275,19 @@ class QueryService {
   ///      the whole result (e.g. a "status" column alone, all "Pending")
   ///      → a similar fallback — technically not empty, but equally
   ///      useless for telling the results apart.
-  ///   4. Otherwise → a short deterministic lead-in, then rows rendered
-  ///      with each column labeled ("Sanctioned amount: 333377.21", not
-  ///      a bare comma-joined value) and formatted (numbers rounded to
-  ///      2dp with floating-point noise trimmed, YYYY-MM-DD dates spelled
-  ///      out) — see [_labeledPairs]. A single row gets one bullet per
-  ///      field; multiple rows get one bullet per row, fields joined by
-  ///      " · " so the list stays scannable.
+  ///   4. A single row → one labeled bullet per field ("Name: ...",
+  ///      "Phone: ...") — see [_labeledPairs].
+  ///   5. Multiple rows, few enough columns (≤ [_maxTableColumns]) →
+  ///      rendered as a real markdown table, one column per selected
+  ///      field, so values line up for scanning instead of wrapping into
+  ///      one long line per row. `chat_bubble.dart` sets
+  ///      `tableColumnWidth: FlexColumnWidth()`, so this can't overflow
+  ///      the chat bubble regardless of value length — cells wrap instead.
+  ///   6. Multiple rows with *more* columns than that → a table would
+  ///      squeeze every header into a cramped, heavily-wrapped cell, so
+  ///      this instead renders one labeled block per row ("**Result
+  ///      1**" then a bullet per field), the same safe format shape 4
+  ///      already uses for a single row.
   String _buildDeterministicAnswer(
       List<Map<String, dynamic>> rows,
       String? sql,
@@ -325,8 +338,40 @@ class QueryService {
       return 'Here\'s what I found:\n\n$bullets';
     }
 
-    final bullets = joinedRows.map((s) => '- $s').join('\n');
-    return 'Here\'s what I found — ${rows.length} in total:\n$bullets';
+    final columnCount = displayRows.first.length;
+    if (columnCount <= _maxTableColumns) {
+      final headers = displayRows.first.keys.map(_humanizeColumnLabel).toList();
+      final tableRows =
+      displayRows.map((row) => row.values.map(_formatValue).toList()).toList();
+      final table = _buildMarkdownTable(headers, tableRows);
+      return 'Here\'s what I found — ${rows.length} in total:\n\n$table';
+    }
+
+    final blocks = List.generate(labeledRows.length, (i) {
+      final bullets = labeledRows[i].map((p) => '- $p').join('\n');
+      return '**Result ${i + 1}**\n$bullets';
+    }).join('\n\n');
+    return 'Here\'s what I found — ${rows.length} in total:\n\n$blocks';
+  }
+
+  /// Columns beyond this render as one labeled block per row instead of a
+  /// table — past this width, equal-share column division (see
+  /// `chat_bubble.dart`'s `FlexColumnWidth`) starts squeezing headers like
+  /// "Disbursement date" into cells too narrow to read comfortably.
+  static const int _maxTableColumns = 5;
+
+  /// Renders [headers] and [rows] as a GFM markdown table. Cell values are
+  /// sanitized — pipe characters escaped, newlines collapsed to spaces —
+  /// since a literal `|` or line break inside a cell would otherwise break
+  /// the table's row structure.
+  String _buildMarkdownTable(List<String> headers, List<List<String>> rows) {
+    String cell(String s) =>
+        s.replaceAll('|', r'\|').replaceAll('\n', ' ').trim();
+    final headerLine = '| ${headers.map(cell).join(' | ')} |';
+    final separatorLine = '|${headers.map((_) => '---').join('|')}|';
+    final bodyLines =
+    rows.map((r) => '| ${r.map(cell).join(' | ')} |').join('\n');
+    return '$headerLine\n$separatorLine\n$bodyLines';
   }
 
   /// Renders [row] as "Label: formatted value" pairs, one per column, in
