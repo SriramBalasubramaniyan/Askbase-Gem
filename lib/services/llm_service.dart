@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -8,6 +9,58 @@ import '../config/api_config.dart';
 import '../models/db_schema_model.dart';
 
 const _prefKeyApiKey = 'gemini_api_key';
+
+/// A single mutable handle a caller can hold onto and call [cancel] on to
+/// abort an in-flight [LlmService.generateSql] call. One-shot — create a
+/// new instance per request, not per app lifetime, since [http.Client]
+/// can't be reused after [http.Client.close].
+class CancellationToken {
+  http.Client? _client;
+  bool _cancelled = false;
+  bool get isCancelled => _cancelled;
+
+  void cancel() {
+    _cancelled = true;
+    // Closing the client aborts whatever request is in flight on it —
+    // the pending future completes with a ClientException, which
+    // generateSql recognizes via [isCancelled] and rethrows as
+    // GenerationCancelledException instead of a generic network error.
+    _client?.close();
+  }
+}
+
+/// Thrown when a [CancellationToken] cancels a request already in flight.
+/// Callers should treat this as "the user backed out", not a failure —
+/// no error message, no retry.
+class GenerationCancelledException implements Exception {
+  @override
+  String toString() => 'Generation cancelled.';
+}
+
+/// Thrown when [Connectivity] reports no network before a request is even
+/// attempted — lets the caller skip straight to an "you're offline"
+/// message instead of waiting out the full request timeout first.
+class NoConnectivityException implements Exception {
+  @override
+  String toString() => 'No internet connection.';
+}
+
+/// Thrown for any Gemini API-level failure (network error, non-200
+/// response, malformed response body). [isRetryable] tells the caller
+/// whether re-attempting the same request has any chance of succeeding —
+/// e.g. a timeout or a 429/5xx might clear up; a 401 (bad API key) or 400
+/// (malformed request) will fail identically every time, so retrying just
+/// wastes round-trips and — worse — the self-correction retry loop would
+/// otherwise frame a "your previous SQL failed" message to the model for
+/// an error that has nothing to do with SQL.
+class GeminiApiException implements Exception {
+  final String message;
+  final int? statusCode;
+  final bool isRetryable;
+  GeminiApiException(this.message, {this.statusCode, required this.isRetryable});
+  @override
+  String toString() => message;
+}
 
 /// One prior exchange, reduced to just the two things a follow-up question
 /// needs to resolve references against — the question text and the SQL
@@ -92,10 +145,22 @@ class LlmService {
     List<SqlHistoryTurn> history = const [],
     String? previousAttemptSql,
     String? previousError,
+    CancellationToken? cancelToken,
   }) async {
     final apiKey = await _loadApiKey();
     if (apiKey == null || apiKey.isEmpty) {
-      throw StateError('Gemini API key not set.');
+      throw GeminiApiException('Gemini API key not set.', isRetryable: false);
+    }
+
+    if (cancelToken?.isCancelled ?? false) throw GenerationCancelledException();
+
+    // Cheap local OS-level check, not a real network probe — fails fast
+    // instead of waiting out the full request timeout when we already know
+    // there's no connection.
+    final connectivity = await Connectivity().checkConnectivity();
+    if (connectivity.contains(ConnectivityResult.none) ||
+        connectivity.isEmpty) {
+      throw NoConnectivityException();
     }
 
     final isRetry = previousAttemptSql != null &&
@@ -146,9 +211,12 @@ class LlmService {
       },
     });
 
+    final client = http.Client();
+    if (cancelToken != null) cancelToken._client = client;
+
     http.Response response;
     try {
-      response = await http
+      response = await client
           .post(
         uri,
         headers: {
@@ -159,19 +227,40 @@ class LlmService {
       )
           .timeout(ApiConfig.requestTimeout);
     } catch (e) {
-      throw StateError('Network error while contacting Gemini: $e');
+      if (cancelToken?.isCancelled ?? false) throw GenerationCancelledException();
+      // Timeouts and connection failures are the textbook retryable case —
+      // the same request often succeeds a moment later.
+      throw GeminiApiException(
+        'Network error while contacting Gemini: $e',
+        isRetryable: true,
+      );
+    } finally {
+      client.close();
     }
 
     if (response.statusCode != 200) {
-      throw StateError(
-        'Gemini API error (${response.statusCode}): ${response.body}',
+      final code = response.statusCode;
+      // 401/403: bad or revoked key — will fail identically every time.
+      // 400: malformed request — also won't fix itself on retry (a bad
+      // *SQL* attempt is handled separately, by the self-correction loop
+      // in QueryService, not here).
+      // 429/5xx: rate limit or a transient server-side problem — both
+      // often clear up given a moment, so worth retrying with backoff.
+      final retryable = code == 429 || (code >= 500 && code < 600);
+      throw GeminiApiException(
+        'Gemini API error ($code): ${response.body}',
+        statusCode: code,
+        isRetryable: retryable,
       );
     }
 
     final decoded = jsonDecode(response.body) as Map<String, dynamic>;
     final candidates = decoded['candidates'] as List<dynamic>?;
     if (candidates == null || candidates.isEmpty) {
-      throw StateError('Gemini API returned no candidates.');
+      throw GeminiApiException(
+        'Gemini API returned no candidates.',
+        isRetryable: true,
+      );
     }
     final parts =
         (candidates.first['content']?['parts'] as List<dynamic>?) ?? [];
