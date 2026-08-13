@@ -82,7 +82,10 @@ SchemaSelector.select()             ← word-boundary keyword scoring against th
 │        │                             a single Gemini API request per        │
 │        │                             attempt, with compact recent-turn      │
 │        │                             history (question + SQL only) for      │
-│        │                             resolving follow-up references         │
+│        │                             resolving follow-up references;        │
+│        │                             connectivity-checked and cancellable   │
+│        │                             before/during each request — see       │
+│        │                             "Resilience" below                     │
 │        ▼                                                                    │
 │   SqlColumnValidator.check()       ← deterministic, no DB I/O: table/column │
 │        │                             existence, undeclared-table detection, │
@@ -133,14 +136,15 @@ In **debug builds**, the SQL disclosure panel shows which tables were selected f
 
 ### Self-correction retry loop
 
-`QueryService.ask()` doesn't give up after the first bad query. SQL generation, validation, and execution run in a loop of up to 3 total attempts:
+`QueryService.ask()` doesn't give up after the first bad query. SQL generation, validation, and execution run in a loop of up to 3 total attempts — but the loop now handles two genuinely different kinds of failure differently, not just "retry the same way every time":
 
 1. Generate SQL.
 2. Check it deterministically with `SqlColumnValidator` (see below) — free, no database round-trip.
 3. If that passes, run `DbService.validateSql()` (SELECT-only enforcement) and then actually execute it.
-4. If any step fails, the *specific* reason — not a generic "it failed" — is fed back into the next generation attempt: `"Your previous SQL failed to run: {sql}\n\nError: {reason}\n\nFix the query..."`
+4. If validation or execution fails, the *specific* reason — not a generic "it failed" — is fed back into the next generation attempt: `"Your previous SQL failed to run: {sql}\n\nError: {reason}\n\nFix the query..."`. This is the **SQL self-correction** path — no delay before retrying, since there's nothing to wait out.
+5. If the `LlmService.generateSql()` call itself fails (not a SQL problem — a network error, timeout, or a non-200 response from Gemini), the loop instead classifies *that* failure — see "Resilience" below — and only retries if it's the kind of error retrying can plausibly fix, with a backoff delay first.
 
-If all 3 attempts fail, the user gets an honest `"I couldn't come up with a working query for '{question}' right now"` rather than a wrong answer. In debug builds, every attempt's SQL and failure reason is logged (`developer.log`, tagged `QueryService`) so you can see exactly where a question is failing and why. Note each retry is a separate Gemini API request — a question that needs all 3 attempts costs 3x the requests of one that succeeds on the first try.
+If all attempts are exhausted (or a non-retryable failure hits immediately), the user gets an honest, specific message rather than a wrong answer — see "Resilience" and Troubleshooting below for what each failure type actually shows. In debug builds, every attempt's SQL and failure reason is logged (`developer.log`, tagged `QueryService`) so you can see exactly where a question is failing and why. Note each retry is a separate Gemini API request — a question that needs all 3 attempts costs 3x the requests of one that succeeds on the first try.
 
 ### Deterministic SQL validation (`SqlColumnValidator`)
 
@@ -200,7 +204,7 @@ Two rules live directly in `LlmService`'s system prompt to fix shapes the model 
 | Provider | Google Gemini Developer API |
 | Endpoint | `https://generativelanguage.googleapis.com/v1beta` (the free-tier REST endpoint — no billing account, no Google Cloud project setup required) |
 | Model | `gemini-flash-lite-latest` — always resolves to the newest Flash-Lite model, the lowest-token-cost / highest-free-quota tier Gemini offers |
-| Auth | Personal API key, entered once via `ApiKeyScreen`, stored on-device with `shared_preferences` |
+| Auth | Personal API key, entered once via `ApiKeyScreen`, stored on-device with `flutter_secure_storage` (Keychain on iOS, Keystore-backed encrypted storage on Android) |
 | Requests per question | Exactly 1 per attempt (up to 3 with retries) |
 | Internet after setup | **Required** — every question makes a live API call |
 
@@ -209,6 +213,18 @@ Get a free key at [aistudio.google.com/app/apikey](https://aistudio.google.com/a
 **Why Flash-Lite?** SQL generation from a handful of pre-filtered tables is a short, structured, low-reasoning task — exactly what Flash-Lite is built for. It carries the most generous free-tier rate limits of any Gemini model, which matters directly since every question in this app is a live API call rather than a one-time download.
 
 **Changing your key:** tap the key icon in the chat screen's top bar at any time to clear the stored key and re-enter a new one.
+
+### Resilience: retries, connectivity, and cancellation
+
+Every `LlmService.generateSql()` failure now throws one of three typed exceptions instead of a generic error, so `QueryService`'s retry loop can react appropriately instead of treating every failure the same way:
+
+- **`GeminiApiException`** — any Gemini API-level failure (network error, non-200 response, malformed response body). Carries `isRetryable`: `429` (rate limit) and `5xx` (server-side) responses, plus timeouts and connection failures, are retryable — the same request often succeeds a moment later. `401`/`403` (bad or revoked key) and `400` (malformed request) are **not** retryable — they'll fail identically every time, so the loop returns immediately with a specific message instead of burning the remaining attempts. This also avoids a subtler bug: retrying used to frame *every* failure to the model as "your previous SQL failed, fix it" — nonsensical for an auth error that has nothing to do with SQL.
+- **`NoConnectivityException`** — thrown before the HTTP call is even attempted, via a `connectivity_plus` check (`Connectivity().checkConnectivity()`) at the start of every attempt. This is a cheap local OS-level check, not a real network probe, so it can be wrong (e.g. connected to Wi-Fi with no real internet behind it, such as a captive portal) — but it correctly catches the common case (airplane mode, no signal) instantly instead of waiting out the full `ApiConfig.requestTimeout` (30s) first.
+- **`GenerationCancelledException`** — thrown when a `CancellationToken` is cancelled mid-request. `QueryService.ask()` accepts an optional `cancelToken`; `AppState` creates one per `sendMessage()` call and exposes `cancelCurrentQuery()`, wired to a stop button in `InputBar` that appears in place of the send button while a response is generating. A cancelled request shows no error and isn't retried — `AppState` removes the "thinking" placeholder entirely rather than leaving an empty bubble behind.
+
+**Backoff:** a retryable `GeminiApiException` waits before the next attempt — `600ms × 2^(attempt-1)` (plain exponential backoff), so attempt 2 waits 600ms and attempt 3 waits 1.2s. This delay is *not* applied to SQL self-correction retries (wrong column, failed validation) — those aren't rate-limit or network problems, so there's nothing to wait out; only a network/API-level retryable failure incurs it.
+
+**Cancellation timing caveat:** cancellation is checked at the *start* of each `generateSql()` call and by aborting the `http.Client` mid-request. If cancellation happens while the loop is sleeping through a backoff delay (rare — only reachable after a retryable API error), the wait still completes before the cancellation is recognized, since `Future.delayed` itself isn't interruptible. In practice this adds at most ~1.2s.
 
 ### Guardrails (`GuardrailService`)
 
@@ -435,10 +451,10 @@ Gemini's context window is far larger than this app will ever need, so there's n
 
 - Only `SELECT` statements are allowed. `DROP`, `DELETE`, `UPDATE`, `INSERT`, `ALTER`, `CREATE`, `REPLACE`, `TRUNCATE`, `ATTACH`, `DETACH`, `PRAGMA` are all rejected.
 - The database is opened and protected at the query validation layer via `validateSql()`.
-- The Gemini API key is stored on-device via `shared_preferences` in plain text. This is fine for personal or single-user field use; if you're distributing this app to other people's devices, swap `shared_preferences` for `flutter_secure_storage` in `llm_service.dart`.
+- The Gemini API key is stored on-device via `flutter_secure_storage` — Keychain on iOS, an encrypted Keystore-backed store on Android. A version of this app before this change stored it in plain `shared_preferences`; `LlmService._loadApiKey()` migrates a key found there to secure storage automatically on first read and deletes the old copy, so existing installs don't get logged out.
 - Only the question text and the selected table/column names (never row data) are sent to Google as part of SQL generation. Query *results* never leave the device — the answer is assembled from local database rows in Dart.
 - `GuardrailService` rejects obvious prompt-injection phrasing ("ignore previous instructions", "reveal your prompt", etc.) before a question ever reaches the API, and the system prompt itself instructs the model to treat the question and conversation history as data, never as instructions — two independent layers, since neither one alone is airtight against a sufficiently creative rephrasing.
-- Saved chat history (titles and full conversations, including generated SQL) is stored on-device via `shared_preferences`, same trust level as the API key above.
+- Saved chat history (titles and full conversations, including generated SQL) is stored on-device via `shared_preferences` — a lower trust level than the API key above (plain storage vs. Keychain/Keystore-encrypted), which is an intentional trade-off: `flutter_secure_storage` is slower per read/write and isn't the right tool for a growing, frequently-read dataset like chat history the way it is for a single small credential.
 
 ---
 
@@ -462,12 +478,12 @@ Gemini's context window is far larger than this app will ever need, so there's n
 
 ### "The AI model encountered an error while generating a query"
 - Usually a Gemini API problem, not a SQL problem. Check the `errorDetail` on the result (or the debug log) for the underlying HTTP status:
-    - **401 / `API_KEY_INVALID`** — the stored key is wrong or has been revoked. Tap the key icon in the chat screen to re-enter it.
-    - **429 / `RESOURCE_EXHAUSTED`** — the free tier's requests-per-minute or requests-per-day limit was hit. Wait (RPM limits clear within a minute; RPD resets at midnight Pacific) or reduce request volume.
-    - **Network error / timeout** — no internet connectivity, or the request exceeded `ApiConfig.requestTimeout` (30s). Unlike the old on-device model, AskBase Gem now needs a live connection for every question.
+  - **401 / `API_KEY_INVALID`** — the stored key is wrong or has been revoked. As of the retry classification in "Resilience" above, this now fails on the *first* attempt rather than being retried 3 times — you'll see a specific "your API key looks invalid" message pointing at the key icon, not the generic error.
+  - **429 / `RESOURCE_EXHAUSTED`** — the free tier's requests-per-minute or requests-per-day limit was hit. This is retried automatically with backoff (see "Resilience" above) before surfacing an error — if you still see this message, all 3 attempts hit the limit. Wait (RPM limits clear within a minute; RPD resets at midnight Pacific) or reduce request volume.
+  - **Network error / timeout** — the request exceeded `ApiConfig.requestTimeout` (30s), or a connection failure occurred mid-request. Also retried with backoff before surfacing. Unlike the old on-device model, AskBase Gem now needs a live connection for every question.
 
 ### App can't reach Gemini at all
-- Confirm the device has internet access — this is no longer an offline app.
+- If you're actually offline, this is now detected *before* the request is attempted (via a `connectivity_plus` check — see "Resilience" above) rather than after waiting out the full 30s timeout, so you should see a "You're offline" message quickly rather than a generic failure after a long pause. If you're instead seeing the generic error after a delay, you likely have a network connection that reports as "connected" but isn't actually reaching the internet (e.g. a captive portal) — the connectivity check can't detect that case, only genuine no-signal/airplane-mode.
 - Confirm your API key was actually saved: clear it via the key icon and re-enter it.
 
 ### "I can only answer questions about the data in this database" for a question that seems on-topic
@@ -481,6 +497,9 @@ Gemini's context window is far larger than this app will ever need, so there's n
 
 ### Some answers show a table, others show a numbered list instead
 - This is intentional, not inconsistent — `QueryService` renders a real markdown table when a result has 5 or fewer columns (`_maxTableColumns`), and falls back to a numbered `**1.** field: value` block per row above that. A table with too many columns would squeeze headers into unreadably narrow cells on a phone-width screen, so the block layout takes over instead. See "Deterministic answer assembly" above.
+
+### I tapped stop but the response kept generating briefly
+- Expected in one case: if the app was mid-backoff-wait after a retryable API error (see "Resilience" above), the cancellation is only recognized once that wait finishes and the next attempt starts — `Future.delayed` itself can't be interrupted. This adds at most ~1.2s. Outside of that window, cancellation should take effect immediately.
 
 ---
 
@@ -496,6 +515,9 @@ Gemini's context window is far larger than this app will ever need, so there's n
 - **The prompt-injection filter is a short, pattern-level list**, not a general-purpose jailbreak detector — it catches common phrasings, not every way to phrase an override attempt. The system prompt's own hardening is the deeper backstop, not this list.
 - **Chat titles never update after creation.** A title is fixed from the conversation's first question and doesn't change even if the conversation's topic drifts significantly in later turns — there's no rename option currently.
 - **Value formatting is heuristic, not type-aware.** `_formatValue` decides how to display a cell purely from its shape: any string matching `YYYY-MM-DD` is treated as a date and spelled out, and every number is rounded to 2 decimal places. A text column that happens to contain a literal `YYYY-MM-DD`-shaped string for a non-date reason would still get reformatted as a date; a numeric ID-like column that wasn't caught by the `_id`/`id` name-based strip (see "Deterministic answer assembly" above) would get rounded like any other number. Neither has come up in practice with this schema's naming conventions, but it's worth knowing if you swap in a very differently-named database.
+- **The connectivity check is a local OS-level check, not a real internet probe.** `connectivity_plus` reports the device is *associated with* a network (Wi-Fi/cellular), not that the network actually reaches Gemini's servers — a captive portal or a genuinely dead upstream link will still hit the full request timeout before failing, rather than being caught instantly.
+- **Backoff is short and fixed.** Retryable API errors wait `600ms × 2^(attempt-1)` between attempts — enough to smooth over a brief blip or a momentary rate-limit, but not a long enough window to wait out a sustained outage or a `429` that takes longer than a couple seconds to clear.
+- **Cancellation isn't instant during a backoff wait.** If a retryable API error triggers a backoff delay, cancelling during that ~600ms–1.2s window doesn't take effect until the wait finishes and the next attempt starts — see Troubleshooting above.
 
 ---
 
@@ -505,11 +527,13 @@ Gemini's context window is far larger than this app will ever need, so there's n
 |---|---|---|
 | `sqflite` | ^2.3.3 | SQLite access |
 | `http` | ^1.2.2 | Gemini API requests |
+| `connectivity_plus` | ^6.0.5 | Pre-flight network check before each Gemini request |
+| `flutter_secure_storage` | ^9.2.2 | Gemini API key storage (Keychain/Keystore-backed) |
 | `path_provider` | ^2.1.3 | App documents directory |
 | `provider` | ^6.1.2 | State management |
 | `google_fonts` | ^6.3.3 | DM Sans |
 | `flutter_markdown` | ^0.7.3 | Markdown rendering — labeled lists and GFM tables in answers |
-| `shared_preferences` | ^2.2.3 | Gemini API key storage, DB freshness tracking, chat history persistence |
+| `shared_preferences` | ^2.2.3 | DB freshness tracking, chat history persistence |
 | `intl` | ^0.19.0 | Timestamp formatting, chat history date labels |
 
 All validation and guardrail logic (`SqlColumnValidator`, `JoinPathFinder`, `GuardrailService`, `ChatHistoryService`) is plain Dart with no additional package dependencies beyond what's listed above.
