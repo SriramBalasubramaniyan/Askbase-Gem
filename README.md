@@ -21,13 +21,30 @@ AskBase Gem: Here's what I found:
              Address: 34 Main Street
              Total quantity kg: 4793.45
 
+User:        Which crops have insurance claims filed?
+AskBase Gem: Here's what I found — 10 in total:
+
+             | Name    | Category | Season type |
+             |---------|----------|-------------|
+             | Cotton  | Fibre    | Kharif      |
+             | Soybean | Oilseed  | Kharif      |
+             | Banana  | Fruit    | Perennial   |
+             | ...     | ...      | ...         |
+
 User:        List all active loans
 AskBase Gem: Here's what I found — 5 in total:
-             - Loan type: KCC · Sanctioned amount: 192516.55 · Disbursed amount: 333377.21 · Status: Active
-             - Loan type: KCC · Sanctioned amount: 276691.76 · Disbursed amount: 191641.95 · Status: Active
-             - Loan type: Term Loan · Sanctioned amount: 334352.53 · Disbursed amount: 365264.69 · Status: Active
-             - Loan type: Cooperative Loan · Sanctioned amount: 239081.17 · Disbursed amount: 451653.32 · Status: Active
-             - Loan type: Cooperative Loan · Sanctioned amount: 129031.85 · Disbursed amount: 477099.92 · Status: Active
+
+             **1.** Loan type: KCC
+             Sanctioned amount: 192516.55
+             Disbursed amount: 333377.21
+             Interest rate pct: 9.4
+             Disbursement date: 10 Oct 2022
+             Due date: 10 Aug 2024
+             Status: Active
+
+             **2.** Loan type: KCC
+             Sanctioned amount: 276691.76
+             ...
 ```
 
 Under the hood:
@@ -162,7 +179,10 @@ What `_buildDeterministicAnswer` actually does with the rows:
 - **Every remaining column gets a readable label**, not a raw SQL result-column name — `sanctioned_amount` → "Sanctioned amount", `T1.name` → "Name". This also handles the case where the model skips the `AS` alias on an aggregate (`SUM(quantity_kg)` shows up as-is in raw SQLite results) — that's recognized and humanized the same way an aggregate sentence is: "Total quantity kg", not the raw function call.
 - **Values are formatted, not dumped raw**: numbers are rounded to 2 decimal places with floating-point noise trimmed (`4793.450000000001` → `4793.45`, `100.0` → `100`), and any `YYYY-MM-DD` string is spelled out (`2022-10-10` → `10 Oct 2022`).
 - **If every row is left with nothing after ID-stripping**, or **every remaining row's labeled details are identical** (e.g. a lone `status` column that just says "Pending" 11 times), an explicit fallback message is returned instead of a misleadingly confident answer — which doubles as a visible signal that the generated SQL under-selected columns, rather than silently glossing over it.
-- **Otherwise**: a single row renders as one labeled line per field (like a small profile card — `Name: ...`, `Phone: ...`, `Total quantity kg: ...`, one per line); multiple rows render as a markdown bullet list, one bullet per row with its fields joined by `·` so the list stays scannable (`- Loan type: KCC · Sanctioned amount: 192516.55 · Status: Active`) — with **no artificial cap** on row count, every row the query returns is shown.
+- **A single row** renders as one labeled line per field (like a small profile card — `Name: ...`, `Phone: ...`, `Total quantity kg: ...`, one per line).
+- **Multiple rows, ≤5 columns** (`QueryService._maxTableColumns`) render as a real **GFM markdown table** — one column per selected field, values lined up for scanning instead of wrapping into one long line per row. `chat_bubble.dart` renders it with `tableColumnWidth: const FlexColumnWidth()`, which divides the bubble's width evenly across columns, so a table can never force the bubble wider than its constraint or overflow off-screen — long cell text wraps within its cell instead, the same way the rest of the answer text does. Rendering GFM table syntax (`| a | b |`) also requires `extensionSet: md.ExtensionSet.gitHubFlavored` on the `MarkdownBody`, since tables aren't part of base CommonMark — off by default in `flutter_markdown`.
+- **Multiple rows, >5 columns** render as one numbered block per row instead — `**1.** Loan type: KCC` followed by the rest of that row's fields, one per line — rather than a table, since past 5 columns equal-share division starts squeezing headers like "Disbursement date" into cells too narrow to read comfortably. This is the same per-row card layout the single-row case above uses, just numbered since there's more than one.
+- **No artificial cap** on row count either way — every row the query returns is shown.
 
 `LlmService` has exactly one model-facing method: `generateSql()`. There is no `summarizeResults()` or results-lead-in generator anymore.
 
@@ -217,6 +237,7 @@ AskBase Gem keeps multiple named conversations, like a standard chat app — not
 - **New chat** — the add-comment icon in the top bar (or "New chat" in the drawer) starts a blank, unsaved draft. It only becomes a real, listed conversation once its first message is actually sent — an empty "New chat" never shows up in the history list, matching how most production chat apps behave.
 - **Chat topic / title** — generated entirely from the conversation's first question, truncated to a word boundary (`ChatHistoryService.titleFromQuestion()`). No model call is involved in naming a chat — this is a deliberate token-saving choice, not a missing feature.
 - **History drawer** — the hamburger icon (top-left, automatically added by Flutter whenever a `Scaffold` has a `drawer`) opens `ChatHistoryDrawer`, listing every saved conversation by title and last-updated time, most recent first. Tapping one loads its full message history; the small × on each row deletes that conversation (with a confirmation dialog).
+- **Deleting the open chat always lands on a blank draft**, never on whatever chat happens to be next in the list. This was a real bug in an earlier version — deleting the current chat fell back to silently loading the next-most-recent saved one, which felt like "popping a stack" rather than the delete actually taking effect. `AppState.deleteChat()` now resets to an unsaved draft unconditionally when the deleted chat was the one open, regardless of how many other chats remain.
 - **Persistence** — handled by `ChatHistoryService`, entirely via `shared_preferences` (no new dependency): a lightweight index (id, title, last-updated) is stored separately from each conversation's full message list, so opening the drawer never has to load every conversation into memory — only the index. A conversation's full messages are loaded lazily, only when it's opened.
 - **In-context follow-ups** — asking "what about last month?" right after "list active loans" works because `AppState` builds a compact history of the current chat's prior `question → generated SQL` pairs and passes it to `LlmService.generateSql()`, which includes it in the prompt so the model can resolve the reference. See "Guardrails" above for how this is kept small.
 - **Old-chat pruning** — `ChatHistoryService` automatically drops conversations older than 90 days (and caps total stored chats at 200) the next time the index is saved, so local storage doesn't grow unbounded over long-term use.
@@ -304,7 +325,9 @@ askbase_gem/
 │       │                                 response is generating; key icon to
 │       │                                 change the stored API key; new-chat icon
 │       └── widgets/
-│           ├── chat_bubble.dart       ← SQL disclosure + debug table panel
+│           ├── chat_bubble.dart       ← SQL disclosure + debug table panel;
+│           │                             renders GFM markdown tables with
+│           │                             FlexColumnWidth (can't overflow the bubble)
 │           ├── input_bar.dart
 │           ├── empty_chat.dart
 │           ├── thinking_indicator.dart
@@ -456,6 +479,9 @@ Gemini's context window is far larger than this app will ever need, so there's n
 ### My question was silently ignored (nothing happened)
 - Likely the send-cooldown (`GuardrailService.minSendInterval`, 1.2s) absorbing an accidental double-tap on send — by design, this case shows no message at all. Wait a moment and send again.
 
+### Some answers show a table, others show a numbered list instead
+- This is intentional, not inconsistent — `QueryService` renders a real markdown table when a result has 5 or fewer columns (`_maxTableColumns`), and falls back to a numbered `**1.** field: value` block per row above that. A table with too many columns would squeeze headers into unreadably narrow cells on a phone-width screen, so the block layout takes over instead. See "Deterministic answer assembly" above.
+
 ---
 
 ## Known limitations
@@ -464,7 +490,8 @@ Gemini's context window is far larger than this app will ever need, so there's n
 - **Free-tier rate limits.** `gemini-flash-lite-latest` has the most generous free-tier limits Gemini offers, but they're still finite (requests-per-minute and requests-per-day caps, reset details vary by Google's current published limits). Heavy or bursty use can hit a 429 — see Troubleshooting above.
 - **Repeated identical mistakes on retry.** The self-correction loop feeds back a specific, accurate error, but the model doesn't always act on it — occasionally it repeats the exact same wrong column/table name across all 3 attempts even when told precisely what the correct one is. `SqlColumnValidator` and `JoinPathFinder` measurably reduce how often this happens (especially for join-path reasoning), but don't eliminate it. Treat repeated "couldn't come up with a working query" failures on a specific question as a signal worth investigating via the debug log, not always a bug in the validation layer.
 - **`IN (...)` lists aren't case-normalized or enum-checked.** Both `COLLATE NOCASE` rewriting and enum-value validation currently only cover direct `=`/`!=`/`<>` string comparisons.
-- **Deterministic answers favor correctness over natural phrasing.** Since the answer text is built entirely in Dart rather than paraphrased by the model, multi-row answers read as a labeled, structured list ("Here's what I found — 5 in total: - Loan type: KCC · Status: Active") rather than free-form prose. This was a deliberate trade after LLM-generated summaries proved unreliable — see "Deterministic answer assembly" above.
+- **Deterministic answers favor correctness over natural phrasing.** Since the answer text is built entirely in Dart rather than paraphrased by the model, multi-row answers render as a markdown table (≤5 columns) or a numbered per-row block (more columns) rather than free-form prose. This was a deliberate trade after LLM-generated summaries proved unreliable — see "Deterministic answer assembly" above.
+- **The table/block split is a fixed column-count threshold (5), not a judgment call.** A result with exactly 6 columns falls to the per-row block layout even though a table might still have read fine; there's no attempt to measure actual content width per column, just column count.
 - **The domain-relevance guardrail is heuristic, not semantic.** It reuses `SchemaSelector`'s keyword scoring, so a genuinely on-topic question phrased with none of the schema's vocabulary can be rejected before it ever reaches Gemini (a false rejection costs nothing, but is still a UX rough edge — see Troubleshooting above).
 - **The prompt-injection filter is a short, pattern-level list**, not a general-purpose jailbreak detector — it catches common phrasings, not every way to phrase an override attempt. The system prompt's own hardening is the deeper backstop, not this list.
 - **Chat titles never update after creation.** A title is fixed from the conversation's first question and doesn't change even if the conversation's topic drifts significantly in later turns — there's no rename option currently.
@@ -481,11 +508,13 @@ Gemini's context window is far larger than this app will ever need, so there's n
 | `path_provider` | ^2.1.3 | App documents directory |
 | `provider` | ^6.1.2 | State management |
 | `google_fonts` | ^6.3.3 | DM Sans |
-| `flutter_markdown` | ^0.7.3 | Markdown rendering (bullet lists in answers) |
+| `flutter_markdown` | ^0.7.3 | Markdown rendering — labeled lists and GFM tables in answers |
 | `shared_preferences` | ^2.2.3 | Gemini API key storage, DB freshness tracking, chat history persistence |
 | `intl` | ^0.19.0 | Timestamp formatting, chat history date labels |
 
 All validation and guardrail logic (`SqlColumnValidator`, `JoinPathFinder`, `GuardrailService`, `ChatHistoryService`) is plain Dart with no additional package dependencies beyond what's listed above.
+
+`chat_bubble.dart` also imports `package:markdown/markdown.dart` for `md.ExtensionSet.gitHubFlavored` (needed to render table syntax). This resolves as a transitive dependency of `flutter_markdown` without needing its own `pubspec.yaml` entry — but if a future `flutter_markdown` upgrade ever changes that, add `markdown: ^7.2.2` directly.
 
 ---
 
