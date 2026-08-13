@@ -1,4 +1,4 @@
-name: askbase
+name: askbase_gem
 description: Natural language query interface over any structured SQLite database, powered by an on-device SLM. Fully offline — no API keys, no network calls after setup.
 publish_to: 'none'
 version: 1.0.0+1

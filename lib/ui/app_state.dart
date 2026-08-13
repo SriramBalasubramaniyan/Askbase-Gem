@@ -31,6 +31,7 @@ class AppState extends ChangeNotifier {
   String? _currentChatId;
   final List<ChatMessage> _messages = [];
   bool _isProcessing = false;
+  CancellationToken? _currentCancelToken;
   DateTime? _lastSentAt;
 
   // ── Getters ───────────────────────────────────────────────────────────────
@@ -167,6 +168,12 @@ class AppState extends ChangeNotifier {
 
   // ── Chat ──────────────────────────────────────────────────────────────────
 
+  /// Aborts the in-flight Gemini request, if any. Safe to call when
+  /// nothing is running — [_currentCancelToken] is null between requests.
+  void cancelCurrentQuery() {
+    _currentCancelToken?.cancel();
+  }
+
   Future<void> sendMessage(String question) async {
     if (_isProcessing) return;
     final trimmed = question.trim();
@@ -201,6 +208,7 @@ class AppState extends ChangeNotifier {
     }
 
     _isProcessing = true;
+    _currentCancelToken = CancellationToken();
 
     final userMsg = ChatMessage(
       id: '${DateTime.now().millisecondsSinceEpoch}_u',
@@ -245,6 +253,7 @@ class AppState extends ChangeNotifier {
         question: trimmed,
         schema: _schema,
         history: sqlHistory,
+        cancelToken: _currentCancelToken,
         onToken: (token) {
           streamedContent += token;
           _updateAssistantMessage(
@@ -255,14 +264,22 @@ class AppState extends ChangeNotifier {
         },
       );
 
-      _updateAssistantMessage(
-        assistantId,
-        content: result.summary.isNotEmpty ? result.summary : streamedContent,
-        state: MessageState.done,
-        generatedSql: result.generatedSql,
-        rawData: result.rawJson,
-        selectedTableNames: result.selectedTableNames,
-      );
+      if (result.status == QueryResultStatus.cancelled) {
+        // The user backed out mid-generation — remove the "thinking"
+        // placeholder entirely rather than leaving an empty assistant
+        // bubble or showing an error for something they chose to do.
+        _messages.removeWhere((m) => m.id == assistantId);
+      } else {
+        _updateAssistantMessage(
+          assistantId,
+          content:
+          result.summary.isNotEmpty ? result.summary : streamedContent,
+          state: MessageState.done,
+          generatedSql: result.generatedSql,
+          rawData: result.rawJson,
+          selectedTableNames: result.selectedTableNames,
+        );
+      }
     } catch (e) {
       _updateAssistantMessage(
         assistantId,
@@ -271,6 +288,7 @@ class AppState extends ChangeNotifier {
       );
     }
 
+    _currentCancelToken = null;
     _isProcessing = false;
     await _persistCurrentChat(firstQuestionForTitle: trimmed);
     notifyListeners();

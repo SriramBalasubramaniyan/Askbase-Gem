@@ -17,6 +17,8 @@ enum QueryResultStatus {
   sqlError,
   emptyResult,
   llmError,
+  cancelled,
+  offline,
 }
 
 class QueryResult {
@@ -51,19 +53,21 @@ class QueryService {
   final _selector = SchemaSelector.instance;
 
   /// Total SQL-generation attempts per question: 1 initial try + this many
-  /// self-correction retries. Kept small on purpose — each attempt is a
-  /// full on-device generation call, not free on a 0.5B model on a phone,
-  /// and a question that's genuinely unanswerable from the schema won't be
-  /// fixed by trying harder.
+  /// self-correction retries, plus retries for retryable Gemini API errors
+  /// (timeouts, 429s, 5xxs — see [_isRetryableAttemptError]). Kept small on
+  /// purpose — each attempt is a full Gemini API request, and a question
+  /// that's genuinely unanswerable from the schema won't be fixed by
+  /// trying harder.
   static const int _maxRetries = 2;
   static const int _maxAttempts = _maxRetries + 1;
 
-  /// Multi-row results with more fields per row than this render as a
-  /// numbered card (one field per line) instead of a single `·`-joined
-  /// line — see [_buildDeterministicAnswer]. A dot-joined line still
-  /// reads fine at 2-3 fields; beyond that it wraps into an unreadable
-  /// wall of text in a phone-width chat bubble.
-  static const int _wideRowFieldThreshold = 3;
+  /// Base delay before a retryable attempt (network blip, 429, 5xx) is
+  /// retried, doubled each attempt (attempt 1 fails → wait this long;
+  /// attempt 2 fails → wait 2x this) — plain exponential backoff. Not
+  /// applied to SQL self-correction retries (wrong column, failed
+  /// validation, etc.) — those aren't rate-limit or network problems, so
+  /// there's nothing to wait out.
+  static const Duration _retryBaseDelay = Duration(milliseconds: 600);
 
   /// Matches the sole column of a single-row/single-column result against
   /// an aggregate function shape, capturing the function name and its
@@ -80,6 +84,7 @@ class QueryService {
     required DatabaseSchema schema,
     required void Function(String token) onToken,
     List<SqlHistoryTurn> history = const [],
+    CancellationToken? cancelToken,
   }) async {
     // ── Step 1: Select relevant tables semantically ─────────────────────────
     final selectedTables = _selector.select(question, schema);
@@ -118,12 +123,46 @@ class QueryService {
           history: history,
           previousAttemptSql: isRetry ? rawSql : null,
           previousError: isRetry ? lastError : null,
+          cancelToken: cancelToken,
         );
-      } catch (e) {
+      } on GenerationCancelledException {
+        // User backed out — not a failure, nothing to show or log as an
+        // error, no retry.
+        return const QueryResult(
+          status: QueryResultStatus.cancelled,
+          summary: '',
+        );
+      } on NoConnectivityException {
+        // No network at all — retrying won't help until connectivity
+        // comes back, so surface this immediately rather than burning
+        // the remaining attempts against a connection that isn't there.
+        return QueryResult(
+          status: QueryResultStatus.offline,
+          summary: 'You\'re offline. Check your connection and try again.',
+          selectedTableNames: debugTables,
+        );
+      } on GeminiApiException catch (e) {
         lastError = e.toString();
         if (kDebugMode) {
           developer.log('Attempt $attempt: generation threw — $lastError',
               name: 'QueryService');
+        }
+        if (!e.isRetryable) {
+          // A 401/403 (bad key) or 400 (malformed request) will fail
+          // identically on every attempt — retrying wastes round-trips,
+          // and worse, would frame an unrelated auth error to the model
+          // on the next attempt as if it were a SQL mistake to fix.
+          final message = e.statusCode == 401 || e.statusCode == 403
+              ? 'Your Gemini API key looks invalid or has been revoked. '
+              'Update it via the key icon and try again.'
+              : 'The AI model encountered an error while generating a '
+              'query. Please try again.';
+          return QueryResult(
+            status: QueryResultStatus.llmError,
+            summary: message,
+            errorDetail: lastError,
+            selectedTableNames: debugTables,
+          );
         }
         if (attempt == _maxAttempts) {
           return QueryResult(
@@ -135,7 +174,26 @@ class QueryService {
             selectedTableNames: debugTables,
           );
         }
+        // Retryable (timeout, 429, 5xx) — back off before trying again
+        // instead of hammering an already-struggling endpoint immediately.
+        await Future.delayed(_retryBaseDelay * (1 << (attempt - 1)));
         continue;
+      } catch (e) {
+        // Anything else unexpected — treat like a non-retryable failure
+        // rather than looping blind on an error type we don't recognize.
+        lastError = e.toString();
+        if (kDebugMode) {
+          developer.log('Attempt $attempt: generation threw — $lastError',
+              name: 'QueryService');
+        }
+        return QueryResult(
+          status: QueryResultStatus.llmError,
+          summary:
+          'The AI model encountered an error while generating a '
+              'query. Please try again.',
+          errorDetail: lastError,
+          selectedTableNames: debugTables,
+        );
       }
 
       rawSql = candidateSql;

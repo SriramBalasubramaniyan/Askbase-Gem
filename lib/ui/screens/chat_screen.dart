@@ -65,21 +65,21 @@ class _ChatScreenState extends State<ChatScreen> {
             child: state.messages.isEmpty
                 ? EmptyChat(schema: state.schema)
                 : ListView.builder(
-                    controller: _scrollController,
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 16,
-                      vertical: 12,
-                    ),
-                    itemCount: state.messages.length,
-                    itemBuilder: (context, index) {
-                      final msg = state.messages[index];
-                      if (msg.isAssistant &&
-                          msg.state == MessageState.thinking) {
-                        return const ThinkingIndicator();
-                      }
-                      return ChatBubble(message: msg);
-                    },
-                  ),
+              controller: _scrollController,
+              padding: const EdgeInsets.symmetric(
+                horizontal: 16,
+                vertical: 12,
+              ),
+              itemCount: state.messages.length,
+              itemBuilder: (context, index) {
+                final msg = state.messages[index];
+                if (msg.isAssistant &&
+                    msg.state == MessageState.thinking) {
+                  return const ThinkingIndicator();
+                }
+                return ChatBubble(message: msg);
+              },
+            ),
           ),
 
           // ── Input bar ──────────────────────────────────────────────────
@@ -87,6 +87,10 @@ class _ChatScreenState extends State<ChatScreen> {
             controller: _inputController,
             isProcessing: state.isProcessing,
             onSend: _sendMessage,
+            // While a response is generating, InputBar swaps its send
+            // button for a stop button that calls this instead — see
+            // AppState.cancelCurrentQuery().
+            onCancel: () => context.read<AppState>().cancelCurrentQuery(),
           ),
         ],
       ),
@@ -160,7 +164,7 @@ class _ChatScreenState extends State<ChatScreen> {
                 ? 'Wait for the response to finish'
                 : 'Delete chat',
             onPressed:
-                state.isProcessing ? null : () => _confirmClear(context, state),
+            state.isProcessing ? null : () => _confirmClear(context, state),
           ),
         const SizedBox(width: 8),
       ],
@@ -191,7 +195,7 @@ class _ChatScreenState extends State<ChatScreen> {
             const SizedBox(height: 8),
             Text(
               'This conversation will be removed from your chat history. '
-              'The database and your other chats stay intact.',
+                  'The database and your other chats stay intact.',
               style: AppTextStyles.bodySecondary,
             ),
             const SizedBox(height: 24),
