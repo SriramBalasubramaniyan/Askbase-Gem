@@ -2,13 +2,20 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:connectivity_plus/connectivity_plus.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../config/api_config.dart';
 import '../models/db_schema_model.dart';
 
-const _prefKeyApiKey = 'gemini_api_key';
+const _secureKeyApiKey = 'gemini_api_key';
+// Old shared_preferences key — kept only so _loadApiKey can migrate a key
+// saved by a version of this app from before the switch to secure
+// storage. Safe to delete this constant and the migration branch below a
+// couple of releases from now, once installs still on the old storage
+// have had a chance to launch at least once.
+const _legacyPrefKeyApiKey = 'gemini_api_key';
 
 /// A single mutable handle a caller can hold onto and call [cancel] on to
 /// abort an in-flight [LlmService.generateSql] call. One-shot — create a
@@ -79,6 +86,7 @@ class LlmService {
   static final LlmService instance = LlmService._();
 
   String? _apiKey;
+  final _secureStorage = const FlutterSecureStorage();
 
   /// How many prior turns are ever sent as context. Kept small — each turn
   /// costs input tokens on every subsequent request in the conversation,
@@ -97,21 +105,37 @@ class LlmService {
 
   Future<String?> _loadApiKey() async {
     if (_apiKey != null) return _apiKey;
+
+    final fromSecureStorage =
+    await _secureStorage.read(key: _secureKeyApiKey);
+    if (fromSecureStorage != null && fromSecureStorage.isNotEmpty) {
+      _apiKey = fromSecureStorage;
+      return _apiKey;
+    }
+
+    // One-time migration: a key saved before this app switched to secure
+    // storage still lives in shared_preferences. Move it over, then
+    // remove the old copy so it doesn't linger somewhere less protected.
     final prefs = await SharedPreferences.getInstance();
-    _apiKey = prefs.getString(_prefKeyApiKey);
-    return _apiKey;
+    final legacy = prefs.getString(_legacyPrefKeyApiKey);
+    if (legacy != null && legacy.isNotEmpty) {
+      await _secureStorage.write(key: _secureKeyApiKey, value: legacy);
+      await prefs.remove(_legacyPrefKeyApiKey);
+      _apiKey = legacy;
+      return _apiKey;
+    }
+
+    return null;
   }
 
   Future<void> saveApiKey(String key) async {
     final trimmed = key.trim();
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_prefKeyApiKey, trimmed);
+    await _secureStorage.write(key: _secureKeyApiKey, value: trimmed);
     _apiKey = trimmed;
   }
 
   Future<void> clearApiKey() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.remove(_prefKeyApiKey);
+    await _secureStorage.delete(key: _secureKeyApiKey);
     _apiKey = null;
   }
 

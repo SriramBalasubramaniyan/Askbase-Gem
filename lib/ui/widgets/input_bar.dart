@@ -6,12 +6,14 @@ class InputBar extends StatelessWidget {
   final TextEditingController controller;
   final bool isProcessing;
   final void Function(String) onSend;
+  final VoidCallback? onCancel;
 
   const InputBar({
     super.key,
     required this.controller,
     required this.isProcessing,
     required this.onSend,
+    this.onCancel,
   });
 
   @override
@@ -73,15 +75,27 @@ class InputBar extends StatelessWidget {
 
           const SizedBox(width: 10),
 
-          // ── Send button ──────────────────────────────────────────────
+          // ── Send / stop button ───────────────────────────────────────
+          // While processing, the same visual slot becomes tappable and
+          // cancels the in-flight request instead of sending — no need to
+          // know what _ProcessingButton actually looks like internally,
+          // wrapping it is enough to make it interactive.
           AnimatedSwitcher(
             duration: const Duration(milliseconds: 200),
             child: isProcessing
-                ? const _ProcessingButton(key: ValueKey('proc'))
+                ? Tooltip(
+              key: const ValueKey('proc'),
+              message: onCancel == null ? '' : 'Stop generating',
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: onCancel,
+                child: const _ProcessingButton(),
+              ),
+            )
                 : _SendButton(
-                    key: const ValueKey('send'),
-                    onTap: () => onSend(controller.text),
-                  ),
+              key: const ValueKey('send'),
+              onTap: () => onSend(controller.text),
+            ),
           ),
         ],
       ),
@@ -115,7 +129,7 @@ class _SendButton extends StatelessWidget {
 }
 
 class _ProcessingButton extends StatelessWidget {
-  const _ProcessingButton({super.key});
+  const _ProcessingButton();
 
   @override
   Widget build(BuildContext context) {
