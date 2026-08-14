@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:provider/provider.dart';
 
 // Schema — swap this import to change the active database domain
@@ -29,6 +30,8 @@ void main() async {
       systemNavigationBarIconBrightness: Brightness.light,
     ),
   );
+
+  await dotenv.load(fileName: ".env");
 
   runApp(
     ChangeNotifierProvider(
